@@ -1,0 +1,116 @@
+version: "3.9"
+
+# =============================================================================
+#  GraphRAG Research Assistant — docker-compose.yml
+#
+#  Services:
+#    backend   — FastAPI application (Python 3.11)
+#    neo4j     — Graph database (Neo4j 5.20)
+#    frontend  — React SPA served by nginx
+#
+#  Usage:
+#    cp .env.example .env          # fill in real credentials
+#    docker compose up --build -d
+#
+#  NOTE: The .env file is loaded via env_file; it is NEVER baked into images.
+# =============================================================================
+
+networks:
+  graphrag-network:
+    driver: bridge
+
+volumes:
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
+
+services:
+
+  # ── Neo4j Graph Database ────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.20
+    container_name: graphrag-neo4j
+    restart: unless-stopped
+    networks:
+      - graphrag-network
+    environment:
+      # Credentials are pulled from .env via NEO4J_PASSWORD variable
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_memory_heap_initial__size: "512m"
+      NEO4J_dbms_memory_heap_max__size: "2G"
+      NEO4J_dbms_memory_pagecache_size: "512m"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      # Mount the schema init script for manual import
+      - ./infra/neo4j/init.cypher:/var/lib/neo4j/import/init.cypher:ro
+    ports:
+      - "7474:7474"   # HTTP browser UI
+      - "7687:7687"   # Bolt protocol
+    healthcheck:
+      test:
+        - "CMD"
+        - "cypher-shell"
+        - "-u"
+        - "neo4j"
+        - "-p"
+        - "${NEO4J_PASSWORD}"
+        - "RETURN 1"
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: graphrag-backend
+    restart: unless-stopped
+    networks:
+      - graphrag-network
+    # Credentials injected at runtime; never baked into the image
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Mount a local cache dir for sentence-transformers model weights
+    volumes:
+      - type: bind
+        source: ${HUGGINGFACE_CACHE_DIR:-./hf_cache}
+        target: /app/.cache/huggingface
+
+  # ── React / Vite Frontend (served by nginx) ─────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: graphrag-frontend
+    restart: unless-stopped
+    networks:
+      - graphrag-network
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
