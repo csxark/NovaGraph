@@ -17,7 +17,7 @@ import uuid
 from typing import Literal, Optional, Any
 
 from mistralai.client import Mistral
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.config import Settings
 from backend.extractor.domain_detector import DomainResult
@@ -75,6 +75,18 @@ class NodeModel(BaseModel):
     chunk_ref: str = Field(default='', description='chunk_id this entity was found in.')
     paper_id: str = Field(default='', description='Parent paper identifier.')
 
+    @model_validator(mode='before')
+    @classmethod
+    def preprocess_fields(cls, obj: Any) -> Any:
+        if isinstance(obj, dict):
+            allowed = set(NodeType.__args__)  # type: ignore[attr-defined]
+            if 'type' in obj and obj['type'] not in allowed:
+                logger.debug(
+                    'Unknown node type %r — remapping to Entity.', obj['type']
+                )
+                obj = {**obj, 'type': 'Entity'}
+        return obj
+
     @property
     def entity_id(self) -> str:
         return self.id
@@ -90,8 +102,9 @@ class EdgeModel(BaseModel):
     evidence: str = Field(default='', description='Supporting text snippet.')
     paper_id: str = Field(default='', description='Parent paper identifier.')
 
+    @model_validator(mode='before')
     @classmethod
-    def model_validate(cls, obj: Any, **kwargs: Any) -> 'EdgeModel':
+    def preprocess_fields(cls, obj: Any) -> Any:
         if isinstance(obj, dict):
             # Coerce 'name' → 'source_name' if LLM uses wrong field name
             if 'source_name' not in obj and 'name' in obj:
@@ -103,7 +116,7 @@ class EdgeModel(BaseModel):
                     'Unknown edge type %r — remapping to RELATED_TO.', obj['type']
                 )
                 obj = {**obj, 'type': 'RELATED_TO'}
-        return super().model_validate(obj, **kwargs)
+        return obj
 
 
 class GraphSchema(BaseModel):
@@ -241,6 +254,23 @@ async def extract_entities(
         text=text,
     )
 
+    # Rough token estimate: 1 token ≈ 4 characters
+    estimated_input_tokens = len(user_prompt) // 4
+    if estimated_input_tokens > 6000:
+        logger.warning(
+            'Chunk %s estimated input tokens %d > 6000 — truncating text to 3000 chars',
+            chunk_id, estimated_input_tokens,
+        )
+        text = text[:3000]
+        # Rebuild prompt with truncated text
+        user_prompt = EXTRACTION_USER_PROMPT_TEMPLATE.format(
+            domain=domain_result.primary_domain,
+            chunk_index=chunk_index,
+            total='?',
+            section=section,
+            text=text,
+        )
+
     messages: list[dict[str, str]] = [
         {'role': 'system', 'content': EXTRACTION_SYSTEM_PROMPT},
         {'role': 'user', 'content': user_prompt},
@@ -252,10 +282,10 @@ async def extract_entities(
         raw = await _call_mistral_with_retry_after(
             client=client,
             messages=messages,
-            model=settings.mistral_small_model,  # Optimisation 2: Switch to mistral-small
+            model=settings.mistral_small_model,  # Switch to mistral-small
             temperature=0.1,
-            max_tokens=8192,  # Optimisation 6: 8192 max_tokens
-            max_retries=settings.mistral_max_retries,
+            max_tokens=4096,  # was 8192 — smaller output fits within limits
+            max_retries=5,    # was settings.mistral_max_retries — more retries
             base_delay=2.0,
         )
     except Exception as exc:
@@ -267,6 +297,16 @@ async def extract_entities(
         return GraphSchema()
 
     graph = _parse_and_validate(raw)
+
+    logger.info(
+        'Chunk %s parsed: %d entities, %d relationships (raw_len=%d)',
+        chunk_id,
+        len(graph.entities),
+        len(graph.relationships),
+        len(raw),
+    )
+    if not graph.entities:
+        logger.warning('Zero entities from chunk %s. Raw response preview: %r', chunk_id, raw[:500])
 
     # ---- Post-processing ----
     # Attach chunk_ref to every entity
@@ -313,10 +353,19 @@ async def extract_all_chunks(
         return GraphSchema()
 
     # Optimisation 1: Skip references & aggressively merge chunks
-    batched = _merge_chunks_into_batches(chunks, max_chars_per_batch=8000)
+    batched = _merge_chunks_into_batches(chunks, max_chars_per_batch=3000)
 
-    # Optimisation 3: Token-bucket rate limiter (1 req/sec)
-    rate_limiter = _RateLimiter(rate=1.0)
+    logger.info(
+        'Processing %d chunks merged into %d batches for extraction',
+        len(chunks),
+        len(batched),
+    )
+    if not batched:
+        logger.error('All chunks were filtered out during batching — check section names in PDF')
+        return GraphSchema()
+
+    # Optimisation 3: Token-bucket rate limiter (0.8 req/sec)
+    rate_limiter = _RateLimiter(rate=0.8)
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _bounded_extract(chunk: dict) -> GraphSchema:
@@ -338,7 +387,7 @@ async def extract_all_chunks(
 
 def _merge_chunks_into_batches(
     chunks: list[dict],
-    max_chars_per_batch: int = 8000,
+    max_chars_per_batch: int = 3000,
 ) -> list[dict]:
     """Merge consecutive chunks into batches, skipping reference sections."""
     batches: list[dict] = []
@@ -347,9 +396,10 @@ def _merge_chunks_into_batches(
     current_indices: list[int] = []
 
     for chunk in chunks:
-        section = str(chunk.get("section", "") or "").lower()
-        # Skip reference sections — low signal, high token cost
-        if any(kw in section for kw in ("reference", "bibliography", "citation")):
+        section = str(chunk.get("section", "") or "")
+        section_lower = section.lower()
+        skip_sections = {"references", "bibliography", "citations", "reference"}
+        if section_lower in skip_sections:
             continue
 
         text = chunk.get("text", "").strip()
@@ -484,15 +534,18 @@ def _parse_and_validate(raw: str) -> GraphSchema:
 
 
 def _repair_json(json_str: str) -> str:
-    """Attempt to repair a truncated JSON string by closing unclosed brackets/braces/quotes."""
+    """Repair truncated JSON by finding the last complete entity object."""
+    import re
+    import json
+    
     json_str = json_str.strip()
     if not json_str:
-        return "{}"
+        return '{"entities": [], "relationships": []}'
 
+    # First try: Stack-based repair (very good for simple end-of-string truncations)
     in_quote = False
     escape = False
     stack = []
-
     for ch in json_str:
         if escape:
             escape = False
@@ -511,19 +564,77 @@ def _repair_json(json_str: str) -> str:
             if stack:
                 stack.pop()
 
+    candidate = json_str
     if in_quote:
-        json_str += '"'
+        candidate += '"'
 
-    while stack:
-        top = stack.pop()
+    temp_stack = list(stack)
+    while temp_stack:
+        top = temp_stack.pop()
         if top == '{':
-            json_str = json_str.rstrip(':, \n\r\t')
-            json_str += '}'
+            candidate = candidate.rstrip(':, \n\r\t')
+            candidate += '}'
         elif top == '[':
-            json_str = json_str.rstrip(':, \n\r\t')
-            json_str += ']'
+            candidate = candidate.rstrip(':, \n\r\t')
+            candidate += ']'
 
-    return json_str
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict) and ('entities' in parsed or 'relationships' in parsed):
+            return json.dumps(parsed)
+    except Exception:
+        pass
+
+    # Strategy 1: Find last complete entity/relationship object by scanning for '}' boundaries
+    # and attempting to parse up to that point
+    entities_start = json_str.find('"entities"')
+    if entities_start == -1:
+        return '{"entities": [], "relationships": []}'
+
+    best_result = None
+    brace_positions = [i for i, ch in enumerate(json_str) if ch == '}']
+
+    for pos in reversed(brace_positions):
+        candidate = json_str[:pos + 1]
+        # Try to close open structures
+        open_braces = candidate.count('{') - candidate.count('}')
+        open_brackets = candidate.count('[') - candidate.count(']')
+        
+        # Remove unclosed string by stripping to last valid '"' boundary
+        closed = candidate
+        for _ in range(open_brackets):
+            closed = closed.rstrip(', \n\r\t') + ']'
+        for _ in range(open_braces):
+            closed = closed.rstrip(', \n\r\t') + '}'
+        try:
+            parsed = json.loads(closed)
+            if isinstance(parsed, dict) and 'entities' in parsed:
+                best_result = parsed
+                break
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    if best_result:
+        return json.dumps(best_result)
+
+    # Strategy 2: Extract only complete entity objects using regex
+    entity_pattern = re.compile(
+        r'\{\s*"name"\s*:\s*"[^"]*"\s*,\s*"type"\s*:\s*"[^"]*"[^}]*\}',
+        re.DOTALL
+    )
+    matches = entity_pattern.findall(json_str)
+    if matches:
+        entities = []
+        for m in matches:
+            try:
+                entity = json.loads(m)
+                entities.append(entity)
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if entities:
+            return json.dumps({'entities': entities, 'relationships': []})
+
+    return '{"entities": [], "relationships": []}'
 
 
 def _extract_outermost_json(text: str) -> str | None:

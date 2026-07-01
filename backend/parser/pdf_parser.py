@@ -283,6 +283,7 @@ def _extract_sections(full_text: str) -> dict[str, str]:
         )
         sections = _fallback_sections(full_text)
 
+    logger.info('Sections detected: %s', list(sections.keys()))
     return sections
 
 

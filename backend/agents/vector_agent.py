@@ -58,6 +58,12 @@ async def run_vector_agent(
         A :class:`VectorResult` containing matched chunks and their scores.
         On any error the result has ``error`` set and empty lists.
     """
+    if not paper_id:
+        return VectorResult(
+            chunks=[], scores=[], total=0,
+            error="paper_id is required for vector retrieval",
+        )
+
     try:
         # 1. Embed the user query
         query_vector: list[float] = await embed_text(query, settings)

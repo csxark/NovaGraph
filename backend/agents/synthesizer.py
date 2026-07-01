@@ -1,8 +1,11 @@
 """
 Synthesis pipeline for the GraphRAG Research Assistant.
 
-Runs the vector, graph, and entity agents in parallel, merges and ranks the
-retrieved context, then calls Mistral large to generate a grounded answer.
+Runs the vector, graph, and entity agents in parallel, fetches full
+knowledge-graph context, merges and ranks the retrieved context, then calls
+Mistral large to generate a grounded answer.
+
+All retrieval is strictly scoped to *paper_id*.
 """
 
 from __future__ import annotations
@@ -20,8 +23,33 @@ from backend.agents.entity_resolver import EntityResult, resolve_entities
 from backend.agents.graph_agent import GraphResult, run_graph_agent
 from backend.agents.vector_agent import VectorResult, run_vector_agent
 from backend.config import Settings
+from backend.graph.neo4j_queries import get_full_graph_context
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Synthesis prompt template
+# ---------------------------------------------------------------------------
+
+SYNTHESIS_PROMPT = """
+You are an expert research assistant analyzing an academic paper.
+
+KNOWLEDGE GRAPH CONTEXT (entities and relationships extracted from the paper):
+{graph_context}
+
+SEMANTIC SEARCH RESULTS (most relevant text chunks):
+{vector_context}
+
+ENTITY RESOLUTION RESULTS:
+{entity_context}
+
+USER QUESTION: {query}
+
+Answer the question using the knowledge graph context and semantic search results above.
+Be specific, cite entity names and relationships from the graph where relevant.
+If the graph context is insufficient, say so clearly.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -87,14 +115,14 @@ def merge_and_rank_context(
         :class:`SourceCitation`.
     """
     vector_result: VectorResult = results.get("vector") or VectorResult(chunks=[], scores=[], total=0)
-    graph_result: GraphResult = results.get("graph") or GraphResult(nodes=[], edges=[], paths=[], entity_ids_found=[])
+    graph_result: GraphResult = results.get("graph") or GraphResult(anchor_nodes=[], nodes=[], edges=[], paths=[], entity_ids_found=[], traversal_depth=0)
     entity_result: EntityResult = results.get("entities") or EntityResult(resolved_ids=[], expanded_terms=[], matched_nodes=[])
 
     # If agent returned an Exception object wrap it as an errored result
     if isinstance(vector_result, Exception):
         vector_result = VectorResult(chunks=[], scores=[], total=0, error=str(vector_result))
     if isinstance(graph_result, Exception):
-        graph_result = GraphResult(nodes=[], edges=[], paths=[], entity_ids_found=[], error=str(graph_result))
+        graph_result = GraphResult(anchor_nodes=[], nodes=[], edges=[], paths=[], entity_ids_found=[], traversal_depth=0, error=str(graph_result))
     if isinstance(entity_result, Exception):
         entity_result = EntityResult(resolved_ids=[], expanded_terms=[], matched_nodes=[], error=str(entity_result))
 
@@ -202,32 +230,32 @@ def merge_and_rank_context(
 
 async def synthesize_answer(
     query: str,
-    context_text: str,
-    domain: str,
+    graph_context: str,
+    vector_context: str,
+    entity_context: str,
     settings: Settings,
 ) -> str:
-    """Call Mistral large to synthesize a grounded answer from *context_text*.
+    """Call Mistral large to synthesize a grounded answer.
+
+    Uses the structured :data:`SYNTHESIS_PROMPT` with separate sections for
+    knowledge-graph context, vector search results, and entity resolution.
 
     Args:
-        query:        The original user question.
-        context_text: Formatted knowledge-graph context string.
-        domain:       Detected paper domain (e.g. ``'machine_learning'``).
-        settings:     Application settings (holds the Mistral API key).
+        query:          The original user question.
+        graph_context:  Formatted knowledge-graph relationship context.
+        vector_context: Formatted semantic search results.
+        entity_context: Formatted entity resolution results.
+        settings:       Application settings (holds the Mistral API key).
 
     Returns:
         The model's answer as a plain string. On any error returns a fallback
         error message string (never raises).
     """
-    system_prompt = (
-        "You are a research assistant. Answer questions based ONLY on the "
-        "provided knowledge graph context. Be precise, cite specific entities "
-        "by name. If context is insufficient, say so."
-    )
-    user_prompt = (
-        f"Question: {query}\n\n"
-        f"Knowledge Graph Context:\n{context_text}\n\n"
-        f"Domain: {domain}\n\n"
-        "Provide a comprehensive answer with citations to the entities above."
+    user_prompt = SYNTHESIS_PROMPT.format(
+        graph_context=graph_context or "(No graph context available.)",
+        vector_context=vector_context or "(No vector results available.)",
+        entity_context=entity_context or "(No entity resolution results.)",
+        query=query,
     )
 
     try:
@@ -236,7 +264,6 @@ async def synthesize_answer(
             client.chat.complete_async(
                 model=settings.mistral_large_model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.2,
@@ -272,8 +299,10 @@ async def run_pipeline(
 ) -> QueryResponse:
     """Run the full retrieval-augmented generation pipeline.
 
-    Executes vector, graph, and entity agents concurrently, merges their
-    context, generates a Mistral answer, and returns the :class:`QueryResponse`.
+    1. Fetch full knowledge-graph context for the paper.
+    2. Execute vector, graph, and entity agents concurrently.
+    3. Merge and rank their context.
+    4. Generate a Mistral answer using the structured synthesis prompt.
 
     Args:
         query:         The user's question.
@@ -288,7 +317,24 @@ async def run_pipeline(
     """
     query_id = str(uuid.uuid4())
 
-    # Run all three agents concurrently; capture exceptions instead of raising
+    # ------------------------------------------------------------------
+    # Step 0: Fetch the full knowledge-graph context for this paper
+    # ------------------------------------------------------------------
+    try:
+        full_graph = await get_full_graph_context(
+            driver=driver,
+            paper_id=paper_id,
+            max_nodes=150,
+        )
+        graph_context_text = full_graph.get("context_text", "")
+    except Exception as exc:
+        logger.error("Failed to fetch full graph context: %s", exc, exc_info=True)
+        full_graph = {}
+        graph_context_text = ""
+
+    # ------------------------------------------------------------------
+    # Step 1: Run all three agents concurrently
+    # ------------------------------------------------------------------
     vector_coro = run_vector_agent(
         query=query,
         paper_id=paper_id,
@@ -319,7 +365,8 @@ async def run_pipeline(
 
     if isinstance(graph_raw, Exception):
         graph_result = GraphResult(
-            nodes=[], edges=[], paths=[], entity_ids_found=[], error=str(graph_raw)
+            anchor_nodes=[], nodes=[], edges=[], paths=[],
+            entity_ids_found=[], traversal_depth=0, error=str(graph_raw),
         )
     else:
         graph_result: GraphResult = graph_raw  # type: ignore[no-redef]
@@ -331,8 +378,10 @@ async def run_pipeline(
     else:
         entity_result: EntityResult = entity_raw  # type: ignore[no-redef]
 
-    # Merge and rank context
-    context_text, sources = merge_and_rank_context(
+    # ------------------------------------------------------------------
+    # Step 2: Merge and rank agent context (for vector_context section)
+    # ------------------------------------------------------------------
+    vector_context, sources = merge_and_rank_context(
         {
             "vector": vector_result,
             "graph": graph_result,
@@ -340,11 +389,25 @@ async def run_pipeline(
         }
     )
 
-    # Generate LLM answer
+    # Build entity context text from resolved entities
+    entity_context_lines: list[str] = []
+    if not entity_result.error:
+        for node in entity_result.matched_nodes:
+            name = node.get("name", "")
+            etype = node.get("type", node.get("label", "Unknown"))
+            desc = node.get("description", "")
+            if name:
+                entity_context_lines.append(f"- {name} ({etype}): {desc}" if desc else f"- {name} ({etype})")
+    entity_context = "\n".join(entity_context_lines) if entity_context_lines else "(No entities resolved.)"
+
+    # ------------------------------------------------------------------
+    # Step 3: Generate LLM answer with structured prompt
+    # ------------------------------------------------------------------
     answer = await synthesize_answer(
         query=query,
-        context_text=context_text,
-        domain=domain,
+        graph_context=graph_context_text,
+        vector_context=vector_context,
+        entity_context=entity_context,
         settings=settings,
     )
 
@@ -355,6 +418,10 @@ async def run_pipeline(
             "vector_agent": vector_result.model_dump(),
             "graph_agent": graph_result.model_dump(),
             "entity_resolver": entity_result.model_dump(),
+            "full_graph_context": {
+                "node_count": full_graph.get("node_count", 0),
+                "edge_count": full_graph.get("edge_count", 0),
+            },
         }
 
     total_nodes = (

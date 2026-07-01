@@ -246,6 +246,24 @@ async def run_ingestion(
             settings=settings,
         )
         _stage_done(job_id, "entity_extraction", t)
+        
+        # Stamp paper_id onto every entity and edge before writing
+        for entity in graph_schema.entities:
+            entity.paper_id = paper_id
+        for rel in graph_schema.relationships:
+            rel.paper_id = paper_id
+
+        logger.info(
+            "Extraction complete: %d entities, %d relationships for paper %s",
+            len(graph_schema.entities),
+            len(graph_schema.relationships),
+            paper_id,
+        )
+
+        if not graph_schema.entities:
+            logger.error("Entity extraction returned 0 entities for paper %s — aborting ingestion", paper_id)
+            _stage_fail(job_id, "entity_extraction", t, "Zero entities extracted — check Mistral API logs")
+            return
     except Exception as exc:
         _stage_fail(job_id, "entity_extraction", t, str(exc))
         return
@@ -260,6 +278,15 @@ async def run_ingestion(
             settings=settings,
         )
         _stage_done(job_id, "embedding", t)
+        
+        logger.info(
+            "Embedding complete: %d embeddings for %d entities",
+            len(embeddings),
+            len(graph_schema.entities),
+        )
+        if len(embeddings) != len(graph_schema.entities):
+            _stage_fail(job_id, "embedding", t, f"Embedding count mismatch: {len(embeddings)} != {len(graph_schema.entities)}")
+            return
     except Exception as exc:
         _stage_fail(job_id, "embedding", t, str(exc))
         return
@@ -484,36 +511,19 @@ async def upload_pdf(
     # Deterministic paper ID
     paper_id = hashlib.sha256(content).hexdigest()
 
-    # Check if paper already ingested
-    try:
-        driver = await get_driver(settings)
-        already_exists = await paper_exists(driver=driver, paper_id=paper_id)
-    except Exception:
-        already_exists = False
+    # Clean up any existing data for this paper first (both Neo4j and Pinecone)
+    driver = await get_driver(settings)
+    from backend.lifecycle.cleanup import delete_paper_data
+    await delete_paper_data(paper_id=paper_id, driver=driver, settings=settings)
 
-    if already_exists:
-        # Return a synthetic completed job
-        synthetic_job_id = f"existing-{paper_id[:8]}"
-        if synthetic_job_id not in job_store:
-            now = int(time.time() * 1000)
-            job_store[synthetic_job_id] = {
-                "job_id": synthetic_job_id,
-                "paper_id": paper_id,
-                "status": "completed",
-                "stages": {
-                    s: JobStage(stage=s, status="completed")
-                    for s in _INGESTION_STAGES
-                },
-                "created_at": now,
-                "updated_at": now,
-                "error": None,
-            }
-        return UploadResponse(
-            job_id=synthetic_job_id,
-            paper_id=paper_id,
-            status="completed",
-            message="Paper already ingested. Use the paper_id to query.",
-        )
+    # Remove all job_store and trace_store entries for this paper_id
+    stale_jobs = [jid for jid, j in job_store.items() if j.get("paper_id") == paper_id]
+    for jid in stale_jobs:
+        del job_store[jid]
+    
+    stale_traces = [qid for qid, t in list(trace_store.items()) if t.get("paper_id") == paper_id]
+    for qid in stale_traces:
+        del trace_store[qid]
 
     # Create fresh job
     job_id = str(uuid.uuid4())
@@ -613,6 +623,7 @@ async def query_paper(body: QueryRequest) -> QueryResponseModel:
 
     # Persist trace if requested
     if body.include_trace and result.trace:
+        result.trace["paper_id"] = body.paper_id
         trace_store[result.query_id] = result.trace
 
     return QueryResponseModel(
@@ -632,40 +643,30 @@ async def query_paper(body: QueryRequest) -> QueryResponseModel:
 async def get_graph(paper_id: str) -> dict:
     """Return up to 200 nodes and their edges for visualisation."""
     settings = get_settings()
-    driver = await get_driver(settings)
- 
+    try:
+        driver = await get_driver(settings)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Neo4j database connection unavailable: {exc}")
+
     try:
         exists = await paper_exists(driver=driver, paper_id=paper_id)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Neo4j unavailable: {exc}") from exc
- 
+        raise HTTPException(status_code=503, detail=f"Neo4j database query failed: {exc}")
+
     if not exists:
         raise HTTPException(
             status_code=404,
-            detail=f"Paper '{paper_id}' not found.",
+            detail=f"Paper with ID '{paper_id}' not found in the database. Please ingest it first.",
         )
- 
+
     try:
-        subgraph: dict = await get_subgraph(
+        return await get_subgraph(
             driver=driver,
             paper_id=paper_id,
             max_nodes=200,
         )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Graph query error: {exc}") from exc
-
-    nodes: list = subgraph.get("nodes", [])
-    edges: list = subgraph.get("edges", [])
-    truncated: bool = subgraph.get("truncated", False)
-
-    return {
-        "paper_id": paper_id,
-        "node_count": len(nodes),
-        "edge_count": len(edges),
-        "nodes": nodes,
-        "edges": edges,
-        "truncated": truncated,
-    }
+        raise HTTPException(status_code=500, detail=f"Graph retrieval failed: {exc}")
 
 
 @app.get(
@@ -682,28 +683,45 @@ async def get_trace(query_id: str) -> dict:
     return trace_store[query_id]
 
 
-@app.delete("/papers/{paper_id}", summary="Delete a paper and all its graph data")
+@app.delete("/papers/{paper_id}", summary="Delete paper and all associated graph and vector data")
 async def delete_paper(paper_id: str) -> dict:
+    """Delete all Neo4j nodes and Pinecone vectors for *paper_id*, plus
+    remove any matching jobs and traces from the stores."""
     settings = get_settings()
     driver = await get_driver(settings)
 
-    # Delete all Neo4j nodes for this paper
-    async with driver.session() as session:
-        await session.run(
-            "MATCH (n {paper_id: $paper_id}) DETACH DELETE n",
-            paper_id=paper_id,
-        )
+    from backend.lifecycle.cleanup import delete_paper_data
 
-    # Delete all Pinecone vectors for this paper (namespace = paper_id)
-    try:
-        index = get_index(settings)
-        index.delete(delete_all=True, namespace=paper_id)
-    except Exception as exc:
-        logger.warning("Pinecone namespace delete failed: %s", exc)
+    result = await delete_paper_data(
+        paper_id=paper_id, driver=driver, settings=settings,
+    )
 
-    # Remove from job_store
-    to_remove = [jid for jid, j in job_store.items() if j["paper_id"] == paper_id]
-    for jid in to_remove:
+    # Remove from in-memory job store
+    stale_jobs = [jid for jid, j in job_store.items() if j.get("paper_id") == paper_id]
+    for jid in stale_jobs:
         del job_store[jid]
 
-    return {"deleted": True, "paper_id": paper_id}
+    # Remove from in-memory trace store
+    stale_traces = [qid for qid, t in list(trace_store.items()) if t.get("paper_id") == paper_id]
+    for qid in stale_traces:
+        del trace_store[qid]
+
+    return result
+
+
+@app.post("/reset", summary="Clear current session — deletes all ingested paper data")
+async def reset_session() -> dict:
+    """Wipe all ingested paper data from Neo4j and Pinecone, then clear the
+    in-memory job and trace stores.  Called when the user resets the session."""
+    settings = get_settings()
+    driver = await get_driver(settings)
+
+    from backend.lifecycle.cleanup import delete_all_papers
+
+    result = await delete_all_papers(driver=driver, settings=settings)
+
+    job_store.clear()
+    trace_store.clear()
+
+    return {"reset": True, "papers_deleted": result}
+

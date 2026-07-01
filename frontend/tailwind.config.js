@@ -25,6 +25,19 @@ export default {
           800: '#1e293b',
           700: '#334155',
           600: '#475569'
+        },
+        graphora: {
+          bg: '#050A13',
+          card: '#0B1220',
+          cardHover: '#111A2B',
+          blue: '#3B82F6',
+          cyan: '#22D3EE',
+          purple: '#6366F1',
+          orange: '#F59E0B',
+          green: '#10B981',
+          danger: '#EF4444',
+          textSec: '#A4AEC4',
+          textMuted: '#6B7280'
         }
       },
       animation: {

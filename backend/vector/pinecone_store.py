@@ -17,7 +17,7 @@ from backend.extractor.entity_extractor import NodeModel
 
 logger = logging.getLogger(__name__)
 
-_EMBEDDING_DIMENSION = 384
+_EMBEDDING_DIMENSION = 1024  # Must match mistral-embed output dimension
 _METRIC = "cosine"
 _MAX_TOP_K = 20
 
@@ -50,6 +50,19 @@ def get_index(settings: Settings):
 
     index_name: str = settings.pinecone_index_name
     existing_indexes = [idx["name"] for idx in _pinecone.list_indexes()]
+
+    # If index already exists, verify its dimension matches
+    if index_name in existing_indexes:
+        existing_desc = _pinecone.describe_index(index_name)
+        existing_dim = existing_desc.dimension
+        if existing_dim != _EMBEDDING_DIMENSION:
+            logger.warning(
+                "Pinecone index '%s' has dimension %d but expected %d. "
+                "Deleting and recreating with correct dimension.",
+                index_name, existing_dim, _EMBEDDING_DIMENSION,
+            )
+            _pinecone.delete_index(index_name)
+            existing_indexes = []  # force recreation below
 
     if index_name not in existing_indexes:
         logger.info("Creating Pinecone index '%s' …", index_name)
@@ -107,7 +120,7 @@ def upsert_node(
     per-paper data logically partitioned while staying within Pinecone limits.
     """
     index = get_index(settings)
-    namespace = paper_id[:16]
+    namespace = paper_id
     vector_id = node.entity_id
     metadata = _build_metadata(node, paper_id)
 
@@ -147,7 +160,7 @@ def upsert_batch(
         )
 
     index = get_index(settings)
-    namespace = paper_id[:16]
+    namespace = paper_id
 
     vectors = [
         {
@@ -202,7 +215,7 @@ def query_similar(
     """
     top_k = min(top_k, _MAX_TOP_K)
     index = get_index(settings)
-    namespace = paper_id[:16] if paper_id else ""
+    namespace = paper_id if paper_id else ""
 
     filter_dict: dict[str, Any] = {"paper_id": {"$eq": paper_id}}
     if node_type_filter:
@@ -265,6 +278,6 @@ def delete_paper_vectors(paper_id: str, settings: Settings) -> None:
     most efficient way to bulk-remove per-paper data in Pinecone Serverless.
     """
     index = get_index(settings)
-    namespace = paper_id[:16]
+    namespace = paper_id
     index.delete(delete_all=True, namespace=namespace)
     logger.info("Deleted all vectors for paper %s (namespace '%s')", paper_id, namespace)

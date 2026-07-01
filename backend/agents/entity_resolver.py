@@ -121,6 +121,14 @@ async def resolve_entities(
         matched node dicts. On any error, returns an empty result with the
         error message set.
     """
+    if not paper_id:
+        return EntityResult(
+            resolved_ids=[],
+            expanded_terms=[],
+            matched_nodes=[],
+            error="paper_id is required for entity resolution",
+        )
+
     try:
         terms = extract_query_terms(query)
         if not terms:
