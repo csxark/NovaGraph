@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import sys
 import types
+import backend
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -227,6 +228,12 @@ def _ensure_stub_parser():
     return pdf_module
 
 
+_ORIGINAL_MODULES = {
+    "backend": sys.modules.get("backend"),
+    "backend.parser": sys.modules.get("backend.parser"),
+    "backend.parser.pdf_parser": sys.modules.get("backend.parser.pdf_parser"),
+}
+
 # Ensure stubs are ready at module import time
 _parser_mod = _ensure_stub_parser()
 from backend.parser.pdf_parser import (  # noqa: E402
@@ -236,6 +243,13 @@ from backend.parser.pdf_parser import (  # noqa: E402
     get_chunks,
     parse_pdf,
 )
+
+# Restore sys.modules immediately to prevent pollution
+for k, v in _ORIGINAL_MODULES.items():
+    if v is None:
+        sys.modules.pop(k, None)
+    else:
+        sys.modules[k] = v
 
 
 # ===========================================================================

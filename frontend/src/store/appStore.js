@@ -1,8 +1,18 @@
 import { create } from 'zustand';
 
+// Generate or retrieve user isolation ID from localStorage
+let initialUserId = localStorage.getItem('graphora_user_id');
+if (!initialUserId) {
+  initialUserId = crypto.randomUUID();
+  localStorage.setItem('graphora_user_id', initialUserId);
+}
+
 const useAppStore = create((set) => ({
-  // Current paper
-  currentPaperId: null,
+  // User Isolation ID
+  userId: initialUserId,
+
+  // Current document state
+  currentDocId: null,
   currentPaperName: null,
   ingestionStatus: null, // 'pending' | 'processing' | 'completed' | 'failed'
   jobId: null,
@@ -15,8 +25,8 @@ const useAppStore = create((set) => ({
   messages: [],
 
   // Actions
-  setCurrentPaper: (paperId, paperName, jobId) => set({
-    currentPaperId: paperId,
+  setCurrentDocument: (docId, paperName, jobId) => set({
+    currentDocId: docId,
     currentPaperName: paperName,
     jobId,
     ingestionStatus: 'pending',
@@ -34,7 +44,7 @@ const useAppStore = create((set) => ({
   })),
 
   resetAll: () => set({
-    currentPaperId: null,
+    currentDocId: null,
     currentPaperName: null,
     ingestionStatus: null,
     jobId: null,

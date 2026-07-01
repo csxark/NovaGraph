@@ -182,3 +182,7 @@ cython_debug/
 
 node_modules/
 frontend/node_modules/
+
+# Local databases
+graphora.db
+*.db

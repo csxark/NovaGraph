@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { motion, useScroll, useTransform } from 'framer-motion';
 import { Link, useNavigate } from 'react-router-dom';
 import { 
@@ -9,13 +9,15 @@ import {
   Database, 
   GitBranch, 
   Search, 
-  CheckCircle,
-  HelpCircle
+  CheckCircle 
 } from 'lucide-react';
+import UploadModal from '../components/UploadModal';
 
 export default function LandingPage() {
   const navigate = useNavigate();
   const { scrollY } = useScroll();
+  
+  const [isModalOpen, setIsModalOpen] = useState(false);
   
   // Navbar glass effect on scroll
   const navBg = useTransform(
@@ -83,7 +85,7 @@ export default function LandingPage() {
             <a 
               key={link} 
               href={`#${link.toLowerCase()}`}
-              className="text-sm font-medium text-graphora-textSec hover:text-white transition-colors duration-200"
+              className="text-sm font-medium text-slate-400 hover:text-white transition-colors duration-200"
             >
               {link}
             </a>
@@ -93,7 +95,7 @@ export default function LandingPage() {
         {/* CTA Button */}
         <div>
           <button 
-            onClick={() => navigate('/dashboard')}
+            onClick={() => setIsModalOpen(true)}
             className="flex items-center gap-2 px-5 py-2 rounded-full border border-white/10 bg-white/5 hover:bg-gradient-to-r hover:from-[#3B82F6] hover:to-[#22D3EE] hover:border-transparent hover:shadow-[0_0_15px_rgba(34,211,238,0.3)] transition-all duration-300 text-xs font-semibold text-white group"
           >
             Get Started
@@ -151,7 +153,7 @@ export default function LandingPage() {
               {/* Glowing anchor node on left */}
               <div className="relative z-10 w-24 h-24 rounded-full flex flex-col items-center justify-center bg-[#0B1220] border-2 border-[#22D3EE] shadow-[0_0_30px_rgba(34,211,238,0.4)]">
                 <FileText size={32} className="text-[#22D3EE]" />
-                <span className="absolute -bottom-8 whitespace-nowrap text-xs text-graphora-textSec font-mono">
+                <span className="absolute -bottom-8 whitespace-nowrap text-xs text-slate-400 font-mono">
                   Research Paper
                 </span>
               </div>
@@ -171,14 +173,14 @@ export default function LandingPage() {
               Query with <span className="bg-gradient-to-r from-[#3B82F6] to-[#22D3EE] bg-clip-text text-transparent">Intelligence.</span>
             </h1>
 
-            <p className="text-base text-graphora-textSec max-w-[480px] mb-8 leading-relaxed">
+            <p className="text-base text-slate-400 max-w-[480px] mb-8 leading-relaxed">
               Graphora converts any research paper into a structured knowledge graph and empowers multi-agent retrieval to deliver accurate, evidence-backed answers.
             </p>
 
             {/* Buttons Row */}
             <div className="flex flex-col sm:flex-row gap-4 mb-4 justify-center">
               <button 
-                onClick={() => navigate('/dashboard')}
+                onClick={() => setIsModalOpen(true)}
                 className="flex items-center justify-center gap-2 px-8 py-3.5 rounded-full bg-gradient-to-r from-[#3B82F6] to-[#22D3EE] text-white font-semibold text-sm hover:shadow-[0_0_25px_rgba(59,130,246,0.4)] transition-all duration-300"
               >
                 <Upload size={16} />
@@ -186,7 +188,7 @@ export default function LandingPage() {
               </button>
               
               <button 
-                onClick={() => navigate('/dashboard')}
+                onClick={() => setIsModalOpen(true)}
                 className="flex items-center justify-center gap-2 px-8 py-3.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10 transition-colors duration-200 text-sm font-semibold text-white"
               >
                 <Calendar size={16} className="text-[#22D3EE]" />
@@ -194,7 +196,7 @@ export default function LandingPage() {
               </button>
             </div>
 
-            <p className="text-xs text-graphora-textMuted mt-4">
+            <p className="text-xs text-slate-500 mt-4">
               Works with any field of research
             </p>
           </div>
@@ -271,33 +273,33 @@ export default function LandingPage() {
           <div className="flex flex-wrap items-center justify-center gap-4">
             
             {/* Any Paper */}
-            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-graphora-blue hover:shadow-[0_0_15px_rgba(59,130,246,0.2)] transition-all cursor-pointer group">
-              <FileText size={15} className="text-graphora-blue group-hover:scale-110 transition-transform" />
-              <span className="text-[13px] text-graphora-textSec group-hover:text-white">Any Paper</span>
+            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-[#3B82F6] hover:shadow-[0_0_15px_rgba(59,130,246,0.2)] transition-all cursor-pointer group">
+              <FileText size={15} className="text-[#3B82F6] group-hover:scale-110 transition-transform" />
+              <span className="text-[13px] text-slate-300 group-hover:text-white">Any Paper</span>
             </div>
 
             {/* Structured Knowledge */}
-            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-graphora-cyan hover:shadow-[0_0_15px_rgba(34,211,238,0.2)] transition-all cursor-pointer group">
+            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-[#22D3EE] hover:shadow-[0_0_15px_rgba(34,211,238,0.2)] transition-all cursor-pointer group">
               <Database size={15} className="text-[#22D3EE] group-hover:scale-110 transition-transform" />
-              <span className="text-[13px] text-graphora-textSec group-hover:text-white">Structured Knowledge</span>
+              <span className="text-[13px] text-slate-300 group-hover:text-white">Structured Knowledge</span>
             </div>
 
             {/* Knowledge Graph */}
             <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-[#6366F1] hover:shadow-[0_0_15px_rgba(99,102,241,0.2)] transition-all cursor-pointer group">
               <GitBranch size={15} className="text-[#6366F1] group-hover:scale-110 transition-transform" />
-              <span className="text-[13px] text-graphora-textSec group-hover:text-white">Knowledge Graph</span>
+              <span className="text-[13px] text-slate-300 group-hover:text-white">Knowledge Graph</span>
             </div>
 
             {/* Intelligent Retrieval */}
-            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-graphora-blue hover:shadow-[0_0_15px_rgba(59,130,246,0.2)] transition-all cursor-pointer group">
-              <Search size={15} className="text-graphora-blue group-hover:scale-110 transition-transform" />
-              <span className="text-[13px] text-graphora-textSec group-hover:text-white">Intelligent Retrieval</span>
+            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-[#3B82F6] hover:shadow-[0_0_15px_rgba(59,130,246,0.2)] transition-all cursor-pointer group">
+              <Search size={15} className="text-[#3B82F6] group-hover:scale-110 transition-transform" />
+              <span className="text-[13px] text-slate-300 group-hover:text-white">Intelligent Retrieval</span>
             </div>
 
             {/* Evidence-Backed */}
-            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-graphora-green hover:shadow-[0_0_15px_rgba(16,185,129,0.2)] transition-all cursor-pointer group">
-              <CheckCircle size={15} className="text-graphora-green group-hover:scale-110 transition-transform" />
-              <span className="text-[13px] text-graphora-textSec group-hover:text-white">Evidence-Backed</span>
+            <div className="flex items-center gap-2.5 px-5 py-2.5 rounded-full border border-white/10 bg-white/5 hover:border-[#10B981] hover:shadow-[0_0_15px_rgba(16,185,129,0.2)] transition-all cursor-pointer group">
+              <CheckCircle size={15} className="text-[#10B981] group-hover:scale-110 transition-transform" />
+              <span className="text-[13px] text-slate-300 group-hover:text-white">Evidence-Backed</span>
             </div>
 
           </div>
@@ -324,6 +326,9 @@ export default function LandingPage() {
           }}
         />
       </div>
+
+      {/* Render Upload Modal */}
+      <UploadModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} />
 
     </div>
   );

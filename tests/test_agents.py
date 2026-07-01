@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+import backend
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -279,12 +280,29 @@ def _install_agent_stubs():
     return va_mod, ga_mod, er_mod, pipeline_mod
 
 
+_ORIGINAL_MODULES = {
+    "backend": sys.modules.get("backend"),
+    "backend.agents": sys.modules.get("backend.agents"),
+    "backend.agents.vector_agent": sys.modules.get("backend.agents.vector_agent"),
+    "backend.agents.graph_agent": sys.modules.get("backend.agents.graph_agent"),
+    "backend.agents.entity_resolver": sys.modules.get("backend.agents.entity_resolver"),
+    "backend.agents.pipeline": sys.modules.get("backend.agents.pipeline"),
+}
+
 _va_mod, _ga_mod, _er_mod, _pipeline_mod = _install_agent_stubs()
 
 from backend.agents.entity_resolver import EntityResult, EntityResolver, extract_query_terms
 from backend.agents.graph_agent import GraphAgent, GraphResult
 from backend.agents.pipeline import QueryResponse, run_pipeline, synthesize_answer
 from backend.agents.vector_agent import VectorAgent, VectorResult
+
+# Restore sys.modules immediately to prevent pollution
+for k, v in _ORIGINAL_MODULES.items():
+    if v is None:
+        sys.modules.pop(k, None)
+    else:
+        sys.modules[k] = v
+
 
 
 # ---------------------------------------------------------------------------

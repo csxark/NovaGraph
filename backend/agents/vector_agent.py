@@ -42,7 +42,7 @@ class VectorResult(BaseModel):
 
 async def run_vector_agent(
     query: str,
-    paper_id: str,
+    doc_id: str,
     top_k: int,
     settings: Settings,
 ) -> VectorResult:
@@ -50,18 +50,17 @@ async def run_vector_agent(
 
     Args:
         query:    Natural-language question from the user.
-        paper_id: SHA-256 identifier of the uploaded paper.
+        doc_id:   UUID identifier of the document.
         top_k:    Maximum number of results to return.
         settings: Application settings (holds API keys, model names, etc.).
 
     Returns:
         A :class:`VectorResult` containing matched chunks and their scores.
-        On any error the result has ``error`` set and empty lists.
     """
-    if not paper_id:
+    if not doc_id:
         return VectorResult(
             chunks=[], scores=[], total=0,
-            error="paper_id is required for vector retrieval",
+            error="doc_id is required for vector retrieval",
         )
 
     try:
@@ -71,7 +70,7 @@ async def run_vector_agent(
         # 2. Retrieve similar vectors from Pinecone
         raw_matches: list[dict] = query_similar(
             embedding=query_vector,
-            paper_id=paper_id,
+            doc_id=doc_id,
             top_k=top_k,
             settings=settings,
         )
@@ -91,15 +90,15 @@ async def run_vector_agent(
                     "type": metadata.get("type", ""),
                     "description": metadata.get("description", metadata.get("text", "")),
                     "score": score,
-                    "paper_id": metadata.get("paper_id", paper_id),
+                    "doc_id": metadata.get("doc_id", doc_id),
                 }
             )
             scores.append(score)
 
         logger.info(
-            "VectorAgent: query=%r paper_id=%s top_k=%d -> %d results",
+            "VectorAgent: query=%r doc_id=%s top_k=%d -> %d results",
             query[:60],
-            paper_id,
+            doc_id,
             top_k,
             len(chunks),
         )
@@ -116,22 +115,11 @@ async def run_vector_agent(
 
 
 def build_vector_chain(
-    paper_id: str,
+    doc_id: str,
     top_k: int,
     settings: Settings,
 ) -> RunnableLambda:
     """Return an LCEL RunnableLambda that wraps :func:`run_vector_agent`.
-
-    The returned runnable accepts a *query* string as input and produces a
-    :class:`VectorResult`.
-
-    Args:
-        paper_id: SHA-256 identifier of the paper to search within.
-        top_k:    Maximum number of Pinecone matches to return.
-        settings: Application settings.
-
-    Returns:
-        A RunnableLambda whose ainvoke signature is (query: str) -> VectorResult.
     """
-    bound = partial(run_vector_agent, paper_id=paper_id, top_k=top_k, settings=settings)
+    bound = partial(run_vector_agent, doc_id=doc_id, top_k=top_k, settings=settings)
     return RunnableLambda(bound)

@@ -25,6 +25,11 @@ _UNIQUENESS_CONSTRAINTS: list[tuple[str, str]] = [
         "FOR (p:Paper) REQUIRE p.paper_id IS UNIQUE",
     ),
     (
+        "constraint_paper_doc_id",
+        "CREATE CONSTRAINT constraint_paper_doc_id IF NOT EXISTS "
+        "FOR (p:Paper) REQUIRE p.doc_id IS UNIQUE",
+    ),
+    (
         "constraint_concept_entity_id",
         "CREATE CONSTRAINT constraint_concept_entity_id IF NOT EXISTS "
         "FOR (n:Concept) REQUIRE n.entity_id IS UNIQUE",
@@ -92,6 +97,47 @@ _RANGE_INDEXES: list[tuple[str, str]] = [
         "CREATE INDEX idx_finding_paper_id IF NOT EXISTS "
         "FOR (n:Finding) ON (n.paper_id)",
     ),
+    # doc_id indexes for multi-tenant isolation
+    (
+        "idx_concept_doc_id",
+        "CREATE INDEX idx_concept_doc_id IF NOT EXISTS "
+        "FOR (n:Concept) ON (n.doc_id)",
+    ),
+    (
+        "idx_method_doc_id",
+        "CREATE INDEX idx_method_doc_id IF NOT EXISTS "
+        "FOR (n:Method) ON (n.doc_id)",
+    ),
+    (
+        "idx_evidence_doc_id",
+        "CREATE INDEX idx_evidence_doc_id IF NOT EXISTS "
+        "FOR (n:Evidence) ON (n.doc_id)",
+    ),
+    (
+        "idx_finding_doc_id",
+        "CREATE INDEX idx_finding_doc_id IF NOT EXISTS "
+        "FOR (n:Finding) ON (n.doc_id)",
+    ),
+    (
+        "idx_entity_doc_id",
+        "CREATE INDEX idx_entity_doc_id IF NOT EXISTS "
+        "FOR (n:Entity) ON (n.doc_id)",
+    ),
+    (
+        "idx_reference_doc_id",
+        "CREATE INDEX idx_reference_doc_id IF NOT EXISTS "
+        "FOR (n:Reference) ON (n.doc_id)",
+    ),
+    (
+        "idx_proposition_doc_id",
+        "CREATE INDEX idx_proposition_doc_id IF NOT EXISTS "
+        "FOR (n:Proposition) ON (n.doc_id)",
+    ),
+    (
+        "idx_assumption_doc_id",
+        "CREATE INDEX idx_assumption_doc_id IF NOT EXISTS "
+        "FOR (n:Assumption) ON (n.doc_id)",
+    ),
 ]
 
 _COMPOSITE_INDEXES: list[tuple[str, str]] = [
@@ -99,6 +145,11 @@ _COMPOSITE_INDEXES: list[tuple[str, str]] = [
         "idx_entity_entity_id_paper_id",
         "CREATE INDEX idx_entity_entity_id_paper_id IF NOT EXISTS "
         "FOR (n:Entity) ON (n.entity_id, n.paper_id)",
+    ),
+    (
+        "idx_entity_entity_id_doc_id",
+        "CREATE INDEX idx_entity_entity_id_doc_id IF NOT EXISTS "
+        "FOR (n:Entity) ON (n.entity_id, n.doc_id)",
     ),
 ]
 

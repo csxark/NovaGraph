@@ -23,6 +23,7 @@ import asyncio
 import json
 import sys
 import types
+import backend
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -247,6 +248,13 @@ def _install_stubs():
     return dd_mod, ee_mod
 
 
+_ORIGINAL_MODULES = {
+    "backend": sys.modules.get("backend"),
+    "backend.extractor": sys.modules.get("backend.extractor"),
+    "backend.extractor.domain_detector": sys.modules.get("backend.extractor.domain_detector"),
+    "backend.extractor.entity_extractor": sys.modules.get("backend.extractor.entity_extractor"),
+}
+
 _dd_mod, _ee_mod = _install_stubs()
 
 from backend.extractor.domain_detector import DomainDetector, DomainResult  # noqa: E402
@@ -258,6 +266,13 @@ from backend.extractor.entity_extractor import (  # noqa: E402
     _deduplicate,
     _parse_and_validate,
 )
+
+# Restore sys.modules immediately to prevent pollution
+for k, v in _ORIGINAL_MODULES.items():
+    if v is None:
+        sys.modules.pop(k, None)
+    else:
+        sys.modules[k] = v
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ Performs entity anchoring via full-text search, multi-hop graph traversal,
 and returns a structured :class:`GraphResult` with anchor nodes, neighbors,
 relationships, and traversal depth.
 
-All queries are strictly scoped to *paper_id* — no cross-paper data leakage.
+All queries are strictly scoped to *doc_id* — no cross-paper data leakage.
 """
 
 from __future__ import annotations
@@ -65,12 +65,6 @@ class GraphResult(BaseModel):
 
 def _extract_noun_phrases(query: str) -> list[str]:
     """Extract candidate entity terms from *query* using a simple heuristic.
-
-    Keeps tokens that are:
-    * longer than 4 characters, and
-    * not in the stopword list.
-
-    Returns a deduplicated list preserving first-seen order.
     """
     tokens = re.sub(r"[^\w\s]", " ", query).split()
     seen: set[str] = set()
@@ -90,7 +84,7 @@ def _extract_noun_phrases(query: str) -> list[str]:
 
 async def run_graph_agent(
     query: str,
-    paper_id: str,
+    doc_id: str,
     driver: Any,
     settings: Settings,
 ) -> GraphResult:
@@ -98,34 +92,24 @@ async def run_graph_agent(
 
     Step 1 — Entity anchoring:
         Extract key terms from the query. Find matching nodes in Neo4j using
-        full-text index ``ft_name_desc``, scoped to *paper_id*.
+        full-text index ``ft_name_desc``, scoped to *doc_id*.
 
     Step 2 — Graph expansion:
         For each anchor node, traverse up to 2 hops to retrieve the connected
-        subgraph, scoped to *paper_id*.
+        subgraph, scoped to *doc_id*.
 
     Step 3 — Format output:
         Return a structured dict with ``anchor_nodes``, ``nodes``,
         ``edges``, ``traversal_depth`` for the synthesizer to use.
-
-    Args:
-        query:    Natural-language question from the user.
-        paper_id: SHA-256 identifier of the paper (used as a strict filter).
-        driver:   Neo4j async driver instance.
-        settings: Application settings.
-
-    Returns:
-        A :class:`GraphResult` with anchor nodes, neighbor nodes, edges, and
-        traversal depth. On any error the result has ``error`` set and empty lists.
     """
-    if not paper_id:
+    if not doc_id:
         return GraphResult(
-            error="paper_id is required for graph traversal",
+            error="doc_id is required for graph traversal",
         )
 
     try:
         # ------------------------------------------------------------------
-        # Step 1: Entity anchoring — full-text search scoped to paper_id
+        # Step 1: Entity anchoring — full-text search scoped to doc_id
         # ------------------------------------------------------------------
         candidates = _extract_noun_phrases(query)
         if not candidates:
@@ -134,24 +118,54 @@ async def run_graph_agent(
 
         logger.debug("GraphAgent candidates: %s", candidates)
 
-        # Build the full-text query string from all candidates
+        # Strategy 1: Try full candidate phrase
+        anchor_nodes = []
         query_terms = " ".join(candidates)
-
-        # Full-text search for anchor nodes (top 5)
-        anchor_nodes: list[dict] = []
         try:
             results = await search_nodes_by_label(
-                driver=driver,
-                label="",
-                search_term=query_terms,
-                paper_id=paper_id,
+                driver=driver, label="", search_term=query_terms, doc_id=doc_id,
             )
-            # Take top 5 as anchor nodes
             anchor_nodes = results[:5]
-        except Exception as search_exc:
-            logger.warning(
-                "GraphAgent anchor search failed: %s", search_exc
-            )
+        except Exception as exc:
+            logger.warning("GraphAgent full-phrase search failed: %s", exc)
+
+        # Strategy 2: If no results, try each candidate individually and merge
+        if not anchor_nodes:
+            seen_names: set[str] = set()
+            for term in candidates[:4]:  # max 4 individual lookups
+                try:
+                    results = await search_nodes_by_label(
+                        driver=driver, label="", search_term=term, doc_id=doc_id,
+                    )
+                    for r in results[:2]:
+                        name = r.get("name", "")
+                        if name and name not in seen_names:
+                            seen_names.add(name)
+                            anchor_nodes.append(r)
+                except Exception:
+                    pass
+                if len(anchor_nodes) >= 5:
+                    break
+
+        # Strategy 3: If still no results, fetch top 5 nodes by doc_id directly
+        if not anchor_nodes:
+            try:
+                from backend.graph.neo4j_queries import get_subgraph
+                fallback = await get_subgraph(driver=driver, doc_id=doc_id, max_nodes=5)
+                # Map standard keys
+                anchor_nodes = [
+                    {
+                        "entity_id": n.get("id"),
+                        "name": n.get("name"),
+                        "type": n.get("type"),
+                        "description": n.get("description"),
+                        "_labels": [n.get("type")],
+                    }
+                    for n in fallback.get("nodes", [])[:5]
+                ]
+                logger.info("GraphAgent: using fallback top-5 nodes for doc_id %s", doc_id)
+            except Exception as exc:
+                logger.warning("GraphAgent fallback failed: %s", exc)
 
         # Deduplicate and collect entity IDs from anchors
         seen_ids: set[str] = set()
@@ -164,9 +178,9 @@ async def run_graph_agent(
 
         if not entity_ids:
             logger.info(
-                "GraphAgent: no entities matched for query=%r paper_id=%s",
+                "GraphAgent: no entities matched for query=%r doc_id=%s",
                 query[:60],
-                paper_id,
+                doc_id,
             )
             return GraphResult(
                 anchor_nodes=[],
@@ -179,24 +193,17 @@ async def run_graph_agent(
 
         # ------------------------------------------------------------------
         # Step 2: Graph expansion — 2-hop traversal from anchor nodes
-        # All scoped to paper_id via the updated traverse_from_entities
         # ------------------------------------------------------------------
         traversal_depth = 2
         subgraph: dict = await traverse_from_entities(
             driver=driver,
             entity_ids=entity_ids,
-            paper_id=paper_id,
+            doc_id=doc_id,
             depth=traversal_depth,
         )
 
         all_nodes: list[dict] = subgraph.get("nodes", [])
         all_edges: list[dict] = subgraph.get("edges", [])
-
-        # Separate neighbor nodes (those not in anchor set)
-        neighbor_nodes: list[dict] = [
-            n for n in all_nodes
-            if n.get("entity_id", n.get("id", "")) not in seen_ids
-        ]
 
         logger.info(
             "GraphAgent: query=%r -> %d anchors, %d total nodes, %d edges (depth=%d)",
@@ -238,22 +245,11 @@ async def run_graph_agent(
 
 
 def build_graph_chain(
-    paper_id: str,
+    doc_id: str,
     driver: Any,
     settings: Settings,
 ) -> RunnableLambda:
     """Return an LCEL RunnableLambda that wraps :func:`run_graph_agent`.
-
-    The returned runnable accepts a *query* string and produces a
-    :class:`GraphResult`.
-
-    Args:
-        paper_id: SHA-256 identifier of the paper to traverse.
-        driver:   Neo4j async driver instance.
-        settings: Application settings.
-
-    Returns:
-        A RunnableLambda whose ainvoke signature is (query: str) -> GraphResult.
     """
-    bound = partial(run_graph_agent, paper_id=paper_id, driver=driver, settings=settings)
+    bound = partial(run_graph_agent, doc_id=doc_id, driver=driver, settings=settings)
     return RunnableLambda(bound)

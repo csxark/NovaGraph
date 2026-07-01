@@ -1,9 +1,9 @@
 """
 backend/graph/neo4j_queries.py
 
-Read-only Neo4j query functions for the GraphRAG Research Assistant.
+Read-only Neo4j query functions for the Graphora Research Assistant.
 All queries use $parameter syntax — zero string interpolation of user data.
-Every query is scoped to a specific paper_id — no cross-paper data leakage.
+Every query is scoped to a specific doc_id — no cross-paper data leakage.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ def _record_to_node(node_obj: Any) -> dict[str, Any]:
     """Convert a neo4j Node object to a plain dict including labels."""
     props = dict(node_obj.items())
     props["_labels"] = list(node_obj.labels)
+    props["_element_id"] = node_obj.element_id
     return props
 
 
@@ -44,15 +45,15 @@ def _record_to_rel(rel_obj: Any) -> dict[str, Any]:
 
 async def get_subgraph(
     driver: AsyncDriver,
-    paper_id: str,
+    doc_id: str,
     max_nodes: int = 200,
 ) -> dict[str, Any]:
     """
-    Return a subgraph dict with nodes/edges reachable for the paper.
+    Return a subgraph dict with nodes/edges reachable for the doc_id.
     """
     query = """
-        MATCH (n {paper_id: $paper_id})
-        OPTIONAL MATCH (n)-[r]->(m {paper_id: $paper_id})
+        MATCH (n {doc_id: $doc_id})
+        OPTIONAL MATCH (n)-[r]->(m {doc_id: $doc_id})
         RETURN
             n.entity_id AS source_id,
             n.name AS source_name,
@@ -67,7 +68,7 @@ async def get_subgraph(
         LIMIT $limit
     """
     async with driver.session() as session:
-        result = await session.run(query, paper_id=paper_id, limit=max_nodes)
+        result = await session.run(query, doc_id=doc_id, limit=max_nodes)
         records = await result.data()
 
     nodes = {}
@@ -103,40 +104,33 @@ async def get_subgraph(
         "edges": edges,
         "node_count": len(nodes),
         "edge_count": len(edges),
-        "paper_id": paper_id,
+        "doc_id": doc_id,
     }
 
 
-
 # ---------------------------------------------------------------------------
-# Entity traversal (paper_id-scoped)
+# Entity traversal (doc_id-scoped)
 # ---------------------------------------------------------------------------
 
 async def traverse_from_entities(
     driver: AsyncDriver,
     entity_ids: list[str],
-    paper_id: str,
+    doc_id: str,
     depth: int = 2,
 ) -> dict[str, Any]:
     """
     Return a subgraph reachable within *depth* hops from the given entity_ids,
-    strictly scoped to *paper_id*.
-
-    depth is capped at _MAX_DEPTH (3).  Because depth is a bounded integer
-    (never user-supplied free text), it is safe to embed in the Cypher template
-    for variable-length path syntax which does not support runtime parameters.
+    strictly scoped to *doc_id*.
     """
     depth = min(max(depth, 1), _MAX_DEPTH)
 
-    # Variable-length path — depth must be a literal integer in Cypher syntax
-    # Both start and neighbor nodes are scoped to paper_id
     cypher = (
-        f"MATCH (start) WHERE start.entity_id IN $ids AND start.paper_id = $paper_id "
+        f"MATCH (start) WHERE start.entity_id IN $ids AND start.doc_id = $doc_id "
         f"MATCH p = (start)-[r*1..{depth}]-(neighbor) "
-        "WHERE neighbor.paper_id = $paper_id "
+        "WHERE neighbor.doc_id = $doc_id "
         "RETURN nodes(p) AS path_nodes, relationships(p) AS path_rels"
     )
-    params: dict[str, Any] = {"ids": entity_ids, "paper_id": paper_id}
+    params: dict[str, Any] = {"ids": entity_ids, "doc_id": doc_id}
 
     nodes: dict[str, dict] = {}
     edges: list[dict] = []
@@ -162,23 +156,21 @@ async def traverse_from_entities(
 async def search_nodes_by_label(
     driver: AsyncDriver,
     label: str,
-    paper_id: str,
+    doc_id: str,
     search_term: str,
 ) -> list[dict[str, Any]]:
     """
-    Full-text search via the ft_name_desc index, filtered by paper_id.
-    *label* is accepted as a parameter but filtering is done via paper_id
-    and node properties — the label is NOT interpolated into Cypher.
+    Full-text search via the ft_name_desc index, filtered by doc_id.
     """
     cypher = (
         "CALL db.index.fulltext.queryNodes('ft_name_desc', $term) "
         "YIELD node, score "
-        "WHERE node.paper_id = $paper_id "
+        "WHERE node.doc_id = $doc_id "
         "RETURN node, score "
         "ORDER BY score DESC "
         "LIMIT 20"
     )
-    params: dict[str, Any] = {"term": search_term, "paper_id": paper_id}
+    params: dict[str, Any] = {"term": search_term, "doc_id": doc_id}
 
     records, _, _ = await driver.execute_query(cypher, params)
     results: list[dict[str, Any]] = []
@@ -193,73 +185,74 @@ async def search_nodes_by_label(
 
 
 # ---------------------------------------------------------------------------
-# Lookup by entity_ids (paper_id-scoped)
+# Lookup by entity_ids (doc_id-scoped)
 # ---------------------------------------------------------------------------
 
 async def find_nodes_by_entity_ids(
     driver: AsyncDriver,
     entity_ids: list[str],
-    paper_id: str,
+    doc_id: str,
 ) -> list[dict[str, Any]]:
-    """MATCH any node whose entity_id is in the given list, scoped to paper_id."""
+    """MATCH any node whose entity_id is in the given list, scoped to doc_id."""
     cypher = (
-        "MATCH (n) WHERE n.entity_id IN $ids AND n.paper_id = $paper_id "
+        "MATCH (n) WHERE n.entity_id IN $ids AND n.doc_id = $doc_id "
         "RETURN n"
     )
     records, _, _ = await driver.execute_query(
-        cypher, {"ids": entity_ids, "paper_id": paper_id}
+        cypher, {"ids": entity_ids, "doc_id": doc_id}
     )
     return [_record_to_node(record["n"]) for record in records]
 
 
 # ---------------------------------------------------------------------------
-# Paper helpers
+# Paper/Document helpers
 # ---------------------------------------------------------------------------
 
-async def paper_exists(driver: AsyncDriver, paper_id: str) -> bool:
+async def document_exists(driver: AsyncDriver, doc_id: str) -> bool:
+    """Check if the document exists in the graph database."""
     query = """
-        MATCH (n {paper_id: $paper_id})
-        RETURN count(n) > 0 AS exists
+        MATCH (p:Paper {doc_id: $doc_id})
+        RETURN count(p) > 0 AS exists
         LIMIT 1
     """
     async with driver.session() as session:
-        result = await session.run(query, paper_id=paper_id)
+        result = await session.run(query, doc_id=doc_id)
         record = await result.single()
         return bool(record["exists"]) if record else False
 
 
-async def get_paper_node_count(driver: AsyncDriver, paper_id: str) -> int:
-    """Return the number of nodes tagged with paper_id."""
-    cypher = "MATCH (n {paper_id: $paper_id}) RETURN count(n) AS cnt"
-    records, _, _ = await driver.execute_query(cypher, {"paper_id": paper_id})
+async def get_document_node_count(driver: AsyncDriver, doc_id: str) -> int:
+    """Return the number of nodes tagged with doc_id."""
+    cypher = "MATCH (n {doc_id: $doc_id}) RETURN count(n) AS cnt"
+    records, _, _ = await driver.execute_query(cypher, {"doc_id": doc_id})
     if records:
         return int(records[0]["cnt"])
     return 0
 
 
 # ---------------------------------------------------------------------------
-# Similarity by name (paper_id always required)
+# Similarity by name (doc_id always required)
 # ---------------------------------------------------------------------------
 
 async def find_similar_nodes_by_name(
     driver: AsyncDriver,
     name: str,
-    paper_id: str,
+    doc_id: str,
 ) -> list[dict[str, Any]]:
     """
-    Full-text search by name, always scoped to *paper_id*.
+    Full-text search by name, always scoped to *doc_id*.
 
     Returns up to 10 results ordered by score.
     """
     cypher = (
         "CALL db.index.fulltext.queryNodes('ft_name_desc', $name) "
         "YIELD node, score "
-        "WHERE node.paper_id = $paper_id "
+        "WHERE node.doc_id = $doc_id "
         "RETURN node, score "
         "ORDER BY score DESC "
         "LIMIT 10"
     )
-    params: dict[str, Any] = {"name": name, "paper_id": paper_id}
+    params: dict[str, Any] = {"name": name, "doc_id": doc_id}
 
     records, _, _ = await driver.execute_query(cypher, params)
     results: list[dict[str, Any]] = []
@@ -271,23 +264,21 @@ async def find_similar_nodes_by_name(
 
 
 # ---------------------------------------------------------------------------
-# Full knowledge-graph context for a paper
+# Full knowledge-graph context for a paper (DEPRECATED: replaced by targeted retrieval)
 # ---------------------------------------------------------------------------
 
 async def get_full_graph_context(
     driver: AsyncDriver,
-    paper_id: str,
+    doc_id: str,
     max_nodes: int = 150,
 ) -> dict:
     """
     Retrieve the complete knowledge graph for a paper as structured context.
-
-    Returns nodes, edges, and a pre-formatted text summary (``context_text``)
-    suitable for direct injection into an LLM synthesis prompt.
+    (Kept for compatibility or trace fallback, but Synthesizer now uses targeted retrieval).
     """
     query = """
-        MATCH (n {paper_id: $paper_id})
-        OPTIONAL MATCH (n)-[r]->(m {paper_id: $paper_id})
+        MATCH (n {doc_id: $doc_id})
+        OPTIONAL MATCH (n)-[r]->(m {doc_id: $doc_id})
         RETURN
             n.name AS source_name,
             labels(n)[0] AS source_type,
@@ -299,7 +290,7 @@ async def get_full_graph_context(
         LIMIT $limit
     """
     async with driver.session() as session:
-        result = await session.run(query, paper_id=paper_id, limit=max_nodes)
+        result = await session.run(query, doc_id=doc_id, limit=max_nodes)
         records = await result.data()
 
     nodes: dict[str, dict] = {}
@@ -325,7 +316,6 @@ async def get_full_graph_context(
                 "target": rec["target_name"],
             })
 
-    # Format as LLM-consumable context
     context_lines: list[str] = []
     for edge in edges:
         context_lines.append(

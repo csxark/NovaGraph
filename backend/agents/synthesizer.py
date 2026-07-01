@@ -1,11 +1,11 @@
 """
-Synthesis pipeline for the GraphRAG Research Assistant.
+Synthesis pipeline for the Graphora GraphRAG Research Assistant.
 
-Runs the vector, graph, and entity agents in parallel, fetches full
+Runs the vector, graph, and entity agents in parallel, fetches targeted
 knowledge-graph context, merges and ranks the retrieved context, then calls
 Mistral large to generate a grounded answer.
 
-All retrieval is strictly scoped to *paper_id*.
+All retrieval is strictly scoped to *doc_id*.
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ from backend.agents.entity_resolver import EntityResult, resolve_entities
 from backend.agents.graph_agent import GraphResult, run_graph_agent
 from backend.agents.vector_agent import VectorResult, run_vector_agent
 from backend.config import Settings
-from backend.graph.neo4j_queries import get_full_graph_context
+from backend.graph.neo4j_queries import search_nodes_by_label, traverse_from_entities
+from backend.agents.prompt_architect import classify_intent, generate_prompt_architect_response
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +34,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SYNTHESIS_PROMPT = """
-You are an expert research assistant analyzing an academic paper.
+You are an expert research assistant for Graphora, analyzing a specific academic paper.
 
-KNOWLEDGE GRAPH CONTEXT (entities and relationships extracted from the paper):
+STRICT RULES — follow these without exception:
+1. You ONLY answer questions about the paper whose context is provided. If the user asks anything unrelated to this paper's content, methodology, findings, or contributions, respond: 'I can only answer questions about the uploaded research paper.'
+2. If the user asks anything unrelated to the paper (coding help, general knowledge, other topics), respond with: "I can only answer questions about the uploaded research paper. Please ask something related to its content, methodology, findings, or contributions."
+3. Never generate code, tutorials, or explanations unrelated to the paper's content.
+4. If the knowledge graph context is empty or insufficient, say so clearly and ask the user to rephrase their question about the paper.
+5. Always ground your answer in the provided context. Do not hallucinate facts not present in the graph or semantic results.
+
+KNOWLEDGE GRAPH CONTEXT (entities and relationships from the paper):
 {graph_context}
 
-SEMANTIC SEARCH RESULTS (most relevant text chunks):
+SEMANTIC SEARCH RESULTS (most relevant passages from the paper):
 {vector_context}
 
 ENTITY RESOLUTION RESULTS:
@@ -46,9 +54,7 @@ ENTITY RESOLUTION RESULTS:
 
 USER QUESTION: {query}
 
-Answer the question using the knowledge graph context and semantic search results above.
-Be specific, cite entity names and relationships from the graph where relevant.
-If the graph context is insufficient, say so clearly.
+Answer using ONLY the paper context above. Be specific, cite entity names and relationship types from the graph. If the question is not about this paper, apply Rule 1.
 """
 
 
@@ -76,6 +82,9 @@ class QueryResponse(BaseModel):
     query_id: str
     total_nodes_retrieved: int = 0
     error: Optional[str] = None
+    response_type: str = Field(default='paper_answer')
+    prompts: list[dict] = Field(default_factory=list)
+    domain: str = Field(default='')
 
 
 # ---------------------------------------------------------------------------
@@ -103,22 +112,11 @@ def merge_and_rank_context(
     3. Entity resolver matches (remaining not already seen).
 
     The top 15 unique nodes are formatted into a context string.
-
-    Args:
-        results: Dict with keys ``'vector'``, ``'graph'``, ``'entities'`` mapping
-                 to VectorResult / GraphResult / EntityResult (or Exception on
-                 catastrophic failure — those are treated as empty).
-
-    Returns:
-        Tuple of ``(context_text, sources)`` where *context_text* is a
-        formatted string for the LLM prompt and *sources* is a list of
-        :class:`SourceCitation`.
     """
     vector_result: VectorResult = results.get("vector") or VectorResult(chunks=[], scores=[], total=0)
     graph_result: GraphResult = results.get("graph") or GraphResult(anchor_nodes=[], nodes=[], edges=[], paths=[], entity_ids_found=[], traversal_depth=0)
     entity_result: EntityResult = results.get("entities") or EntityResult(resolved_ids=[], expanded_terms=[], matched_nodes=[])
 
-    # If agent returned an Exception object wrap it as an errored result
     if isinstance(vector_result, Exception):
         vector_result = VectorResult(chunks=[], scores=[], total=0, error=str(vector_result))
     if isinstance(graph_result, Exception):
@@ -126,11 +124,10 @@ def merge_and_rank_context(
     if isinstance(entity_result, Exception):
         entity_result = EntityResult(resolved_ids=[], expanded_terms=[], matched_nodes=[], error=str(entity_result))
 
-    # Containers: list of (entity_id, name, type, description, score, source_agent)
     ranked: list[dict] = []
     seen_ids: set[str] = set()
 
-    # 1. Vector chunks — already score-sorted by Pinecone
+    # 1. Vector chunks
     if not vector_result.error:
         for chunk in sorted(
             vector_result.chunks, key=lambda c: c.get("score", 0.0), reverse=True
@@ -150,7 +147,7 @@ def merge_and_rank_context(
                 }
             )
 
-    # 2. Graph nodes — ranked by subgraph degree
+    # 2. Graph nodes
     if not graph_result.error:
         graph_edges = graph_result.edges
         graph_nodes_sorted = sorted(
@@ -192,10 +189,8 @@ def merge_and_rank_context(
                 }
             )
 
-    # Take top 15
     top = ranked[:15]
 
-    # Build context text
     context_lines: list[str] = []
     for i, item in enumerate(top, start=1):
         name = item["name"] or item["entity_id"]
@@ -208,7 +203,6 @@ def merge_and_rank_context(
 
     context_text = "\n\n".join(context_lines) if context_lines else "(No relevant entities found in the knowledge graph.)"
 
-    # Build sources
     sources: list[SourceCitation] = [
         SourceCitation(
             entity_id=item["entity_id"],
@@ -236,21 +230,17 @@ async def synthesize_answer(
     settings: Settings,
 ) -> str:
     """Call Mistral large to synthesize a grounded answer.
-
-    Uses the structured :data:`SYNTHESIS_PROMPT` with separate sections for
-    knowledge-graph context, vector search results, and entity resolution.
-
-    Args:
-        query:          The original user question.
-        graph_context:  Formatted knowledge-graph relationship context.
-        vector_context: Formatted semantic search results.
-        entity_context: Formatted entity resolution results.
-        settings:       Application settings (holds the Mistral API key).
-
-    Returns:
-        The model's answer as a plain string. On any error returns a fallback
-        error message string (never raises).
     """
+    if (
+        (not graph_context or graph_context.strip() == "(No graph context available.)")
+        and (not vector_context or "No relevant entities" in vector_context)
+    ):
+        logger.warning("Synthesizer: both contexts empty for query=%r — returning guardrail response", query[:60])
+        return (
+            "I don't have enough context from the paper to answer this question. "
+            "Please try rephrasing your question about the paper's content, methods, or findings."
+        )
+
     user_prompt = SYNTHESIS_PROMPT.format(
         graph_context=graph_context or "(No graph context available.)",
         vector_context=vector_context or "(No vector results available.)",
@@ -285,71 +275,211 @@ async def synthesize_answer(
 
 
 # ---------------------------------------------------------------------------
+# Targeted Retrieval Pipeline
+# ---------------------------------------------------------------------------
+
+async def run_targeted_retrieval(
+    query: str,
+    doc_id: str,
+    driver: Any,
+    settings: Settings,
+) -> tuple[str, list[dict], list[dict]]:
+    """
+    Executes the targeted retrieval pipeline:
+      1. Vector search filtered by doc_id (top 10 results).
+      2. Extract unique candidate entity names.
+      3. Neo4j full-text search scoped to doc_id for up to 3 names (top 5 nodes per name).
+      4. 2-hop Neo4j traversal from these anchors (max 20 nodes, max 40 edges).
+      5. Rank nodes by a combined score: semantic similarity + degree centrality in traversal graph.
+      6. Compress to top 15 context nodes and their relationships.
+    """
+    try:
+        # Step 1 & 2: Vector search and name extraction
+        vector_result = await run_vector_agent(query, doc_id, top_k=10, settings=settings)
+        if vector_result.error:
+            logger.warning("Targeted retrieval: Vector search error: %s", vector_result.error)
+        
+        entity_names: list[str] = []
+        seen_names: set[str] = set()
+        # Keep track of vector scores for ranking
+        vector_scores: dict[str, float] = {}
+        for chunk in vector_result.chunks:
+            name = chunk.get("name")
+            eid = chunk.get("entity_id")
+            if name and name.lower() not in seen_names:
+                seen_names.add(name.lower())
+                entity_names.append(name)
+            if eid:
+                vector_scores[eid] = chunk.get("score", 0.0)
+
+        # Step 3: Scoped Neo4j full-text search (top 3 terms, top 5 nodes per term)
+        search_terms = entity_names[:3]
+        anchor_node_ids: list[str] = []
+        anchor_nodes_dict: dict[str, dict] = {}
+        ft_scores: dict[str, float] = {}
+        
+        for term in search_terms:
+            nodes = await search_nodes_by_label(driver, label="", doc_id=doc_id, search_term=term)
+            for node in nodes[:5]:
+                eid = node.get("entity_id")
+                if eid:
+                    anchor_node_ids.append(eid)
+                    anchor_nodes_dict[eid] = node
+                    # Keep full-text score
+                    ft_scores[eid] = node.get("_score", 0.0)
+
+        # Fallback: if no anchor nodes, retrieve up to 5 sample nodes for doc_id
+        if not anchor_node_ids:
+            from backend.graph.neo4j_queries import get_subgraph
+            fallback = await get_subgraph(driver, doc_id=doc_id, max_nodes=5)
+            for node in fallback.get("nodes", [])[:5]:
+                eid = node.get("id")
+                if eid:
+                    anchor_node_ids.append(eid)
+                    anchor_nodes_dict[eid] = {
+                        "entity_id": eid,
+                        "name": node.get("name"),
+                        "type": node.get("type"),
+                        "description": node.get("description"),
+                        "_labels": [node.get("type")]
+                    }
+
+        # Step 4: 2-hop traversal capped at 20 nodes, 40 edges
+        subgraph = {"nodes": [], "edges": []}
+        if anchor_node_ids:
+            subgraph = await traverse_from_entities(driver, anchor_node_ids, doc_id, depth=2)
+        
+        nodes: list[dict] = subgraph.get("nodes", [])[:20]
+        edges: list[dict] = subgraph.get("edges", [])[:40]
+
+        if not nodes:
+            # If traversal returns nothing, just use the anchor nodes
+            nodes = list(anchor_nodes_dict.values())
+            edges = []
+
+        # Step 5: Score and rank by semantic similarity + degree centrality
+        # Degree centrality count
+        node_degrees: dict[str, int] = {}
+        for n in nodes:
+            n_eid = n.get("_element_id") or n.get("entity_id")
+            node_degrees[n_eid] = 0
+            for e in edges:
+                if e.get("_start_node_id") == n_eid or e.get("_end_node_id") == n_eid:
+                    node_degrees[n_eid] += 1
+
+        # Combine scores
+        # Formula: Final = max(vector_score, ft_score / 10) + 0.5 * degree
+        scored_nodes: list[tuple[dict, float]] = []
+        for n in nodes:
+            eid = n.get("entity_id")
+            n_eid = n.get("_element_id") or eid
+            degree = node_degrees.get(n_eid, 0)
+            
+            v_score = vector_scores.get(eid, 0.0)
+            ft_score = ft_scores.get(eid, 0.0) / 10.0
+            semantic_score = max(v_score, ft_score)
+            
+            final_score = semantic_score + 0.5 * degree
+            scored_nodes.append((n, final_score))
+
+        # Sort and get top 15
+        scored_nodes.sort(key=lambda x: x[1], reverse=True)
+        top_15_nodes = [item[0] for item in scored_nodes[:15]]
+        top_15_ids = {n.get("entity_id") for n in top_15_nodes if n.get("entity_id")}
+        top_15_element_ids = {n.get("_element_id") for n in top_15_nodes if n.get("_element_id")}
+
+        # Filter edges to only include relationships between top 15 nodes
+        filtered_edges = []
+        for e in edges:
+            start = e.get("_start_node_id")
+            end = e.get("_end_node_id")
+            if start in top_15_element_ids and end in top_15_element_ids:
+                filtered_edges.append(e)
+
+        # Format context text
+        context_lines: list[str] = []
+        for edge in filtered_edges:
+            # Try to resolve names
+            s_node = next((n for n in top_15_nodes if n.get("_element_id") == edge.get("_start_node_id")), None)
+            t_node = next((n for n in top_15_nodes if n.get("_element_id") == edge.get("_end_node_id")), None)
+            s_name = s_node.get("name") if s_node else "Unknown"
+            t_name = t_node.get("name") if t_node else "Unknown"
+            context_lines.append(
+                f"{s_name} --[{edge.get('_type', 'REL')}]--> {t_name}"
+            )
+            
+        for node in top_15_nodes:
+            desc = node.get("description")
+            if desc:
+                labels = node.get("_labels") or [node.get("type", "Entity")]
+                context_lines.append(
+                    f"{node.get('name')} ({labels[0]}): {desc}"
+                )
+
+        context_text = "\n".join(context_lines) if context_lines else "(No graph context found.)"
+        return context_text, top_15_nodes, filtered_edges
+
+    except Exception as exc:
+        logger.error("Targeted retrieval pipeline error: %s", exc, exc_info=True)
+        return "(No graph context found due to pipeline error.)", [], []
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline
 # ---------------------------------------------------------------------------
 
 
 async def run_pipeline(
     query: str,
-    paper_id: str,
+    doc_id: str,
     driver: Any,
     settings: Settings,
     include_trace: bool = False,
     domain: str = "general",
 ) -> QueryResponse:
     """Run the full retrieval-augmented generation pipeline.
-
-    1. Fetch full knowledge-graph context for the paper.
-    2. Execute vector, graph, and entity agents concurrently.
-    3. Merge and rank their context.
-    4. Generate a Mistral answer using the structured synthesis prompt.
-
-    Args:
-        query:         The user's question.
-        paper_id:      SHA-256 identifier of the target paper.
-        driver:        Neo4j async driver.
-        settings:      Application settings.
-        include_trace: When ``True``, embed raw agent dumps in the response.
-        domain:        Paper domain string forwarded to the LLM prompt.
-
-    Returns:
-        A :class:`QueryResponse` ready for serialisation by FastAPI.
     """
+    intent = classify_intent(query)
+    if intent == 'PROMPT_ARCHITECT':
+        pa_response = await generate_prompt_architect_response(query, settings)
+        return QueryResponse(
+            answer='',
+            sources=[],
+            trace={},
+            query_id=pa_response.query_id,
+            total_nodes_retrieved=0,
+            error=None,
+            response_type='prompt_architect',
+            prompts=[p.model_dump() for p in pa_response.prompts],
+            domain=pa_response.domain,
+        )
+
     query_id = str(uuid.uuid4())
 
-    # ------------------------------------------------------------------
-    # Step 0: Fetch the full knowledge-graph context for this paper
-    # ------------------------------------------------------------------
-    try:
-        full_graph = await get_full_graph_context(
-            driver=driver,
-            paper_id=paper_id,
-            max_nodes=150,
-        )
-        graph_context_text = full_graph.get("context_text", "")
-    except Exception as exc:
-        logger.error("Failed to fetch full graph context: %s", exc, exc_info=True)
-        full_graph = {}
-        graph_context_text = ""
+    # Step 0: Targeted retrieval graph context scoped to doc_id
+    graph_context_text, top_nodes, filtered_edges = await run_targeted_retrieval(
+        query=query,
+        doc_id=doc_id,
+        driver=driver,
+        settings=settings,
+    )
 
-    # ------------------------------------------------------------------
-    # Step 1: Run all three agents concurrently
-    # ------------------------------------------------------------------
+    # Step 1: Run all three agents concurrently (collecting vector/entity details)
     vector_coro = run_vector_agent(
         query=query,
-        paper_id=paper_id,
+        doc_id=doc_id,
         top_k=10,
         settings=settings,
     )
     graph_coro = run_graph_agent(
         query=query,
-        paper_id=paper_id,
+        doc_id=doc_id,
         driver=driver,
         settings=settings,
     )
     entity_coro = resolve_entities(
         query=query,
-        paper_id=paper_id,
+        doc_id=doc_id,
         driver=driver,
         settings=settings,
     )
@@ -357,11 +487,10 @@ async def run_pipeline(
     raw = await asyncio.gather(vector_coro, graph_coro, entity_coro, return_exceptions=True)
     vector_raw, graph_raw, entity_raw = raw
 
-    # Wrap bare exceptions into error-state result models
     if isinstance(vector_raw, Exception):
         vector_result = VectorResult(chunks=[], scores=[], total=0, error=str(vector_raw))
     else:
-        vector_result: VectorResult = vector_raw  # type: ignore[no-redef]
+        vector_result: VectorResult = vector_raw
 
     if isinstance(graph_raw, Exception):
         graph_result = GraphResult(
@@ -369,18 +498,16 @@ async def run_pipeline(
             entity_ids_found=[], traversal_depth=0, error=str(graph_raw),
         )
     else:
-        graph_result: GraphResult = graph_raw  # type: ignore[no-redef]
+        graph_result: GraphResult = graph_raw
 
     if isinstance(entity_raw, Exception):
         entity_result = EntityResult(
             resolved_ids=[], expanded_terms=[], matched_nodes=[], error=str(entity_raw)
         )
     else:
-        entity_result: EntityResult = entity_raw  # type: ignore[no-redef]
+        entity_result: EntityResult = entity_raw
 
-    # ------------------------------------------------------------------
-    # Step 2: Merge and rank agent context (for vector_context section)
-    # ------------------------------------------------------------------
+    # Merge and rank agent context (for semantic results section)
     vector_context, sources = merge_and_rank_context(
         {
             "vector": vector_result,
@@ -389,7 +516,6 @@ async def run_pipeline(
         }
     )
 
-    # Build entity context text from resolved entities
     entity_context_lines: list[str] = []
     if not entity_result.error:
         for node in entity_result.matched_nodes:
@@ -400,9 +526,7 @@ async def run_pipeline(
                 entity_context_lines.append(f"- {name} ({etype}): {desc}" if desc else f"- {name} ({etype})")
     entity_context = "\n".join(entity_context_lines) if entity_context_lines else "(No entities resolved.)"
 
-    # ------------------------------------------------------------------
     # Step 3: Generate LLM answer with structured prompt
-    # ------------------------------------------------------------------
     answer = await synthesize_answer(
         query=query,
         graph_context=graph_context_text,
@@ -411,16 +535,15 @@ async def run_pipeline(
         settings=settings,
     )
 
-    # Optionally embed raw agent dumps in trace
     trace: dict = {}
     if include_trace:
         trace = {
             "vector_agent": vector_result.model_dump(),
             "graph_agent": graph_result.model_dump(),
             "entity_resolver": entity_result.model_dump(),
-            "full_graph_context": {
-                "node_count": full_graph.get("node_count", 0),
-                "edge_count": full_graph.get("edge_count", 0),
+            "targeted_graph_context": {
+                "node_count": len(top_nodes),
+                "edge_count": len(filtered_edges),
             },
         }
 
@@ -430,7 +553,6 @@ async def run_pipeline(
         + len(entity_result.resolved_ids)
     )
 
-    # Determine top-level error flag (only if ALL agents failed)
     all_failed = bool(vector_result.error and graph_result.error and entity_result.error)
     pipeline_error: Optional[str] = None
     if all_failed:

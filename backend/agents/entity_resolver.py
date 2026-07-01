@@ -1,5 +1,5 @@
 """
-Entity resolver for the GraphRAG Research Assistant.
+Entity resolver for the Graphora Research Assistant.
 
 Tokenises the user query, removes stopwords, and looks up each surviving
 term in the Neo4j knowledge graph to produce a deduplicated list of resolved
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import re
-import string
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
@@ -64,19 +63,6 @@ class EntityResult(BaseModel):
 
 def extract_query_terms(query: str) -> list[str]:
     """Tokenise *query* and return candidate entity terms.
-
-    Steps:
-    1. Lowercase and strip punctuation.
-    2. Split on whitespace.
-    3. Remove stopwords.
-    4. Keep only tokens with at least 3 characters.
-    5. Deduplicate while preserving order.
-
-    Args:
-        query: Raw query string from the user.
-
-    Returns:
-        Ordered, deduplicated list of candidate terms.
     """
     # Remove punctuation (except hyphens inside words)
     cleaned = re.sub(r"[^\w\s\-]", " ", query)
@@ -101,7 +87,7 @@ def extract_query_terms(query: str) -> list[str]:
 
 async def resolve_entities(
     query: str,
-    paper_id: str,
+    doc_id: str,
     driver: Any,
     settings: Settings,
 ) -> EntityResult:
@@ -109,24 +95,13 @@ async def resolve_entities(
 
     For each term extracted from *query*, calls ``find_similar_nodes_by_name``
     against Neo4j, then deduplicates results by ``entity_id``.
-
-    Args:
-        query:    Natural-language question from the user.
-        paper_id: SHA-256 identifier of the paper (filter context).
-        driver:   Neo4j async driver instance.
-        settings: Application settings.
-
-    Returns:
-        An :class:`EntityResult` with resolved IDs, expanded term names, and
-        matched node dicts. On any error, returns an empty result with the
-        error message set.
     """
-    if not paper_id:
+    if not doc_id:
         return EntityResult(
             resolved_ids=[],
             expanded_terms=[],
             matched_nodes=[],
-            error="paper_id is required for entity resolution",
+            error="doc_id is required for entity resolution",
         )
 
     try:
@@ -150,7 +125,7 @@ async def resolve_entities(
                 candidates: list[dict] = await find_similar_nodes_by_name(
                     driver=driver,
                     name=term,
-                    paper_id=paper_id,
+                    doc_id=doc_id,
                 )
                 for node in candidates:
                     eid = node.get("entity_id", "")
@@ -161,6 +136,26 @@ async def resolve_entities(
                 logger.warning(
                     "EntityResolver: lookup failed for term %r: %s", term, term_exc
                 )
+
+        # Fallback: if nothing resolved, grab sample nodes from the paper
+        if not matched_nodes:
+            logger.info("EntityResolver: zero matches — using sample nodes as fallback")
+            try:
+                from backend.graph.neo4j_queries import get_subgraph
+                fallback = await get_subgraph(driver=driver, doc_id=doc_id, max_nodes=10)
+                for node in fallback.get("nodes", [])[:5]:
+                    eid = node.get("id", node.get("entity_id", ""))
+                    if eid and eid not in seen_ids:
+                        seen_ids.add(eid)
+                        # Normalize to expected format
+                        matched_nodes.append({
+                            "entity_id": eid,
+                            "name": node.get("name", ""),
+                            "description": node.get("description", ""),
+                            "type": node.get("type", "Entity"),
+                        })
+            except Exception as exc:
+                logger.warning("EntityResolver fallback failed: %s", exc)
 
         resolved_ids: list[str] = [n.get("entity_id", "") for n in matched_nodes if n.get("entity_id")]
         expanded_terms: list[str] = [n.get("name", "") for n in matched_nodes if n.get("name")]

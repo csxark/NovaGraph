@@ -1,16 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import * as d3 from 'd3';
 import { 
-  Home, 
-  FileText, 
-  MessageSquare, 
   GitBranch, 
-  Bookmark, 
-  Settings, 
-  ChevronRight, 
-  ChevronDown,
-  Plus, 
   Search, 
   RotateCcw, 
   Download, 
@@ -21,6 +13,8 @@ import {
 } from 'lucide-react';
 import useAppStore from '../store/appStore';
 import { api } from '../lib/api';
+import Sidebar from '../components/Sidebar';
+import UploadModal from '../components/UploadModal';
 
 const NODE_COLORS = {
   Concept: '#3B82F6',
@@ -36,20 +30,17 @@ const DEFAULT_NODE_COLOR = '#94a3b8';
 
 export default function GraphPage() {
   const navigate = useNavigate();
+  const [isModalOpen, setIsModalOpen] = useState(false);
   
   // Zustand Store
   const {
-    currentPaperId,
+    currentDocId,
     currentPaperName,
     graphNodes,
     graphEdges,
     setGraphData,
     resetAll
   } = useAppStore();
-
-  // Navigation / Collapse states
-  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
-  const [activeNavItem, setActiveNavItem] = useState('Graph Viewer');
 
   // Search & Filters
   const [searchQuery, setSearchQuery] = useState('');
@@ -65,7 +56,7 @@ export default function GraphPage() {
 
   // Pull graph data if not already populated but paper is active
   useEffect(() => {
-    if (!currentPaperId) return;
+    if (!currentDocId) return;
     if (graphNodes.length > 0) {
       if (!selectedNode && graphNodes.length > 0) {
         setSelectedNode(graphNodes[0]);
@@ -73,7 +64,7 @@ export default function GraphPage() {
       return;
     }
 
-    api.getGraph(currentPaperId)
+    api.getGraph(currentDocId)
       .then(data => {
         setGraphData(data.nodes || [], data.edges || []);
         if (data.nodes && data.nodes.length > 0) {
@@ -83,7 +74,7 @@ export default function GraphPage() {
       .catch(err => {
         console.error('Failed to fetch graph:', err);
       });
-  }, [currentPaperId, graphNodes]);
+  }, [currentDocId, graphNodes]);
 
   // Zoom Helpers
   const handleZoomIn = () => {
@@ -110,17 +101,6 @@ export default function GraphPage() {
     }
   };
 
-  // Reset Session
-  const handleReset = async () => {
-    try {
-      await api.reset();
-      resetAll();
-      navigate('/dashboard');
-    } catch (err) {
-      console.error('Reset failed:', err);
-    }
-  };
-
   // Render full screen D3 Graph
   useEffect(() => {
     if (!svgRef.current || graphNodes.length === 0) return;
@@ -128,7 +108,6 @@ export default function GraphPage() {
     // Filter nodes and edges based on filters
     let filteredNodes = graphNodes.filter(n => {
       const name = n.name || '';
-      const type = n.type || '';
       const nameMatch = name.toLowerCase().includes(searchQuery.toLowerCase());
       const typeMatch = selectedTypeFilter === 'All Types' || n.type === selectedTypeFilter;
       return nameMatch && typeMatch;
@@ -208,7 +187,7 @@ export default function GraphPage() {
       .selectAll('text')
       .data(filteredEdges)
       .enter().append('text')
-      .attr('class', 'text-[9px] fill-graphora-textMuted select-none')
+      .attr('class', 'text-[9px] fill-slate-500 select-none')
       .attr('text-anchor', 'middle')
       .text(d => d.type || 'uses');
 
@@ -296,85 +275,8 @@ export default function GraphPage() {
   return (
     <div className="flex h-screen bg-[#050A13] text-white overflow-hidden font-sans relative">
       
-      {/* 260px FIXED SIDEBAR */}
-      <aside className={`shrink-0 h-full bg-[#0B1220] border-r border-white/5 flex flex-col justify-between transition-all duration-300 ${isSidebarCollapsed ? 'w-20' : 'w-[260px]'} relative z-30`}>
-        <div>
-          <div className="h-20 px-6 flex items-center justify-between border-b border-white/5">
-            {!isSidebarCollapsed && (
-              <Link to="/" className="flex items-center gap-3">
-                <div className="w-8 h-8 flex items-center justify-center bg-gradient-to-r from-[#3B82F6] to-[#22D3EE] rounded-lg">
-                  <GitBranch size={18} className="text-white" />
-                </div>
-                <span className="text-lg font-bold tracking-tight text-white">Graphora</span>
-              </Link>
-            )}
-            
-            {isSidebarCollapsed && (
-              <div className="w-8 h-8 mx-auto flex items-center justify-center bg-gradient-to-r from-[#3B82F6] to-[#22D3EE] rounded-lg">
-                <GitBranch size={18} className="text-white" />
-              </div>
-            )}
-
-            <button 
-              onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-              className="p-1 rounded bg-white/5 text-graphora-textSec hover:text-white"
-            >
-              {isSidebarCollapsed ? <ChevronRight size={16} /> : '<<'}
-            </button>
-          </div>
-
-          <div className="p-4">
-            <button 
-              onClick={() => navigate('/dashboard')}
-              className="w-full flex items-center justify-center gap-2 py-3 rounded-full bg-gradient-to-r from-[#3B82F6] to-[#22D3EE] text-white text-sm font-semibold hover:shadow-[0_0_15px_rgba(59,130,246,0.3)] transition-all duration-200"
-            >
-              <Plus size={16} />
-              {!isSidebarCollapsed && 'New Upload'}
-            </button>
-          </div>
-
-          <nav className="px-2 space-y-1">
-            {[
-              { name: 'Home', icon: Home, route: '/dashboard' },
-              { name: 'Graph Viewer', icon: GitBranch, route: '/graph' },
-            ].map((item) => {
-              const Icon = item.icon;
-              const isActive = activeNavItem === item.name;
-              return (
-                <button
-                  key={item.name}
-                  onClick={() => {
-                    setActiveNavItem(item.name);
-                    navigate(item.route);
-                  }}
-                  className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm transition-all ${
-                    isActive 
-                      ? 'text-graphora-blue border-l-[3px] border-graphora-blue bg-graphora-blue/5' 
-                      : 'text-graphora-textSec hover:text-white hover:bg-white/5'
-                  }`}
-                >
-                  <Icon size={18} />
-                  {!isSidebarCollapsed && <span>{item.name}</span>}
-                </button>
-              );
-            })}
-          </nav>
-        </div>
-
-        <div className="p-4 space-y-4">
-          <div className="flex items-center gap-3 p-2 bg-white/5 rounded-xl border border-white/5">
-            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-graphora-blue to-[#6366F1] flex items-center justify-center text-xs font-bold text-white shadow-md">
-              US
-            </div>
-            {!isSidebarCollapsed && (
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-bold text-slate-100 truncate">Workspace User</p>
-                <p className="text-xs text-graphora-textMuted">Researcher</p>
-              </div>
-            )}
-          </div>
-        </div>
-      </aside>
+      {/* Shared Sidebar */}
+      <Sidebar activePage="graph" onNewPaper={() => setIsModalOpen(true)} />
 
       {/* FULL GRAPH CANVAS CONTAINER */}
       <main className="flex-1 flex flex-col h-full overflow-hidden relative z-10">
@@ -382,7 +284,7 @@ export default function GraphPage() {
         {/* Header Bar */}
         <div className="h-20 border-b border-white/5 px-6 flex items-center justify-between shrink-0 bg-[#0B1220]">
           <h1 className="text-lg font-bold text-white flex items-center gap-2">
-            <GitBranch size={20} className="text-graphora-blue" />
+            <GitBranch size={20} className="text-[#3B82F6]" />
             Full Screen Graph
           </h1>
 
@@ -390,13 +292,13 @@ export default function GraphPage() {
           {graphNodes.length > 0 && (
             <div className="flex items-center gap-3">
               <div className="relative">
-                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-graphora-textMuted" />
+                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
                 <input 
                   type="text" 
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="Search nodes..." 
-                  className="bg-white/5 border border-white/5 focus:border-graphora-blue/50 rounded-full pl-9 pr-4 py-2 text-xs text-white placeholder-graphora-textMuted w-52 focus:outline-none"
+                  className="bg-white/5 border border-white/5 focus:border-[#3B82F6]/50 rounded-full pl-9 pr-4 py-2 text-xs text-white placeholder-slate-500 w-52 focus:outline-none"
                 />
               </div>
 
@@ -429,13 +331,13 @@ export default function GraphPage() {
                   setSelectedRelationFilter('All Relations');
                   handleResetZoom();
                 }}
-                className="flex items-center gap-1 px-4 py-2 rounded-full border border-white/10 hover:bg-white/5 text-xs text-graphora-textSec"
+                className="flex items-center gap-1 px-4 py-2 rounded-full border border-white/10 hover:bg-white/5 text-xs text-slate-300"
               >
                 <RotateCcw size={12} />
                 Reset
               </button>
 
-              <button className="flex items-center gap-1.5 px-4 py-2 rounded-full border border-white/10 hover:bg-white/5 text-xs text-graphora-textSec">
+              <button className="flex items-center gap-1.5 px-4 py-2 rounded-full border border-white/10 hover:bg-white/5 text-xs text-slate-300">
                 <Download size={12} />
                 Export
               </button>
@@ -450,7 +352,7 @@ export default function GraphPage() {
             <div className="text-center p-8 max-w-md">
               <GitBranch size={48} className="text-white/15 mx-auto mb-3" />
               <p className="text-sm font-semibold text-slate-300">No graph data yet</p>
-              <p className="text-xs text-graphora-textMuted mt-1">Upload a paper to generate the knowledge graph.</p>
+              <p className="text-xs text-slate-500 mt-1">Upload a paper to generate the knowledge graph.</p>
             </div>
           ) : (
             <>
@@ -464,7 +366,7 @@ export default function GraphPage() {
                       <h3 className="text-sm font-bold text-white truncate">{selectedNode.name}</h3>
                       <button 
                         onClick={() => setSelectedNode(null)}
-                        className="p-1 rounded-lg hover:bg-white/10 text-graphora-textMuted"
+                        className="p-1 rounded-lg hover:bg-white/10 text-slate-500"
                       >
                         <X size={14} />
                       </button>
@@ -481,23 +383,23 @@ export default function GraphPage() {
                     </span>
 
                     <div className="space-y-3">
-                      <p className="text-xs text-graphora-textSec leading-relaxed">
+                      <p className="text-xs text-slate-300 leading-relaxed">
                         {selectedNode.description || 'No description available for this extracted entity.'}
                       </p>
 
                       <div className="border-t border-white/5 pt-3">
-                        <h4 className="text-[10px] font-bold text-graphora-textMuted uppercase tracking-wider mb-2">Properties</h4>
+                        <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-2">Properties</h4>
                         <div className="grid grid-cols-2 gap-2 text-[10px]">
                           {selectedNode.domains && selectedNode.domains.length > 0 && (
                             <>
-                              <div className="text-graphora-textMuted">Domains:</div>
+                              <div className="text-slate-500">Domains:</div>
                               <div className="text-white truncate">{selectedNode.domains.join(', ')}</div>
                             </>
                           )}
                           {selectedNode.properties && Object.entries(selectedNode.properties).map(([k, v]) => (
                             k !== 'name' && k !== 'type' && k !== 'description' && k !== 'domains' && k !== 'id' && (
                               <React.Fragment key={k}>
-                                <div className="text-graphora-textMuted truncate">{k}:</div>
+                                <div className="text-slate-500 truncate">{k}:</div>
                                 <div className="text-white truncate">{String(v)}</div>
                               </React.Fragment>
                             )
@@ -508,7 +410,7 @@ export default function GraphPage() {
                   </div>
 
                   <button 
-                    onClick={() => navigate('/dashboard')}
+                    onClick={() => navigate('/chat')}
                     className="w-full mt-4 flex items-center justify-center gap-1.5 py-2.5 rounded-lg border border-white/10 hover:bg-white/5 text-[11px] font-semibold text-white transition-colors"
                   >
                     View in Chat
@@ -520,25 +422,25 @@ export default function GraphPage() {
               <div className="absolute right-6 bottom-6 flex flex-col gap-2 p-1.5 rounded-xl border border-white/5 bg-[#0B1220]/80 backdrop-blur-md z-20">
                 <button 
                   onClick={handleZoomIn}
-                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-graphora-textSec hover:text-white"
+                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-slate-300 hover:text-white"
                 >
                   <ZoomIn size={16} />
                 </button>
                 <button 
                   onClick={handleZoomOut}
-                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-graphora-textSec hover:text-white"
+                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-slate-300 hover:text-white"
                 >
                   <ZoomOut size={16} />
                 </button>
                 <button 
                   onClick={handleResetZoom}
-                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-graphora-textSec hover:text-white text-xs font-semibold"
+                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-slate-300 hover:text-white text-xs font-semibold"
                 >
                   Fit
                 </button>
                 <button 
-                  onClick={() => navigate('/dashboard')}
-                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-graphora-textSec hover:text-white"
+                  onClick={() => navigate('/chat')}
+                  className="w-8 h-8 rounded-lg hover:bg-white/5 flex items-center justify-center text-slate-300 hover:text-white"
                 >
                   <Minimize2 size={15} />
                 </button>
@@ -549,6 +451,9 @@ export default function GraphPage() {
         </div>
 
       </main>
+
+      {/* Upload Modal */}
+      <UploadModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} />
 
     </div>
   );

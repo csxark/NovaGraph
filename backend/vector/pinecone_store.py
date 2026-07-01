@@ -1,13 +1,14 @@
 """
 backend/vector/pinecone_store.py
 
-Pinecone vector store for the GraphRAG Research Assistant.
+Pinecone vector store for the Graphora Research Assistant.
 Provides upsert and query operations over node embeddings.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from pinecone import Pinecone, ServerlessSpec
@@ -33,11 +34,6 @@ _index = None  # pinecone.Index — no static type available across SDK versions
 def get_index(settings: Settings):
     """
     Return the shared Pinecone Index, creating it if it does not yet exist.
-
-    The index is created with:
-        dimension = 384   (all-MiniLM-L6-v2 output size)
-        metric    = cosine
-        spec      = ServerlessSpec(cloud='aws', region=settings.pinecone_environment)
     """
     global _pinecone, _index
 
@@ -87,19 +83,21 @@ def get_index(settings: Settings):
 # Metadata helpers
 # ---------------------------------------------------------------------------
 
-def _build_metadata(node: NodeModel, paper_id: str) -> dict[str, Any]:
+def _build_metadata(node: NodeModel, doc_id: str, user_id: str) -> dict[str, Any]:
     """Build a Pinecone metadata dict from a NodeModel."""
     description = node.description or ""
     return {
+        "doc_id": doc_id,
+        "user_id": user_id,
         "entity_id": node.entity_id,
         "name": node.name,
         "type": node.type,
         "subtype": node.subtype or "",
         "domains": node.domains or [],
-        "paper_id": paper_id,
         "description": description[:500],  # Pinecone metadata value size limit
         "chunk_ref": node.chunk_ref or "",
         "confidence": node.confidence,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -110,46 +108,34 @@ def _build_metadata(node: NodeModel, paper_id: str) -> dict[str, Any]:
 def upsert_node(
     node: NodeModel,
     embedding: list[float],
-    paper_id: str,
+    doc_id: str,
+    user_id: str,
     settings: Settings,
 ) -> None:
     """
     Upsert a single NodeModel vector into Pinecone.
-
-    namespace is derived from the first 16 characters of paper_id to keep
-    per-paper data logically partitioned while staying within Pinecone limits.
     """
     index = get_index(settings)
-    namespace = paper_id
     vector_id = node.entity_id
-    metadata = _build_metadata(node, paper_id)
+    metadata = _build_metadata(node, doc_id, user_id)
 
     index.upsert(
         vectors=[{"id": vector_id, "values": embedding, "metadata": metadata}],
-        namespace=namespace,
+        namespace="",
     )
-    logger.debug("Upserted node %s into namespace '%s'", vector_id, namespace)
+    logger.debug("Upserted node %s into Pinecone", vector_id)
 
 
 def upsert_batch(
     nodes: list[NodeModel],
     embeddings: list[list[float]],
-    paper_id: str,
+    doc_id: str,
+    user_id: str,
     settings: Settings,
     batch_size: int = 100,
 ) -> int:
     """
     Upsert a batch of NodeModel vectors into Pinecone.
-
-    Args:
-        nodes: NodeModel objects to upsert.
-        embeddings: Pre-computed embeddings; must be the same length as *nodes*.
-        paper_id: Used for namespace derivation and metadata.
-        settings: App settings (API key, index name, region).
-        batch_size: Number of vectors per Pinecone upsert call.
-
-    Returns:
-        Total number of vectors upserted.
     """
     if not nodes:
         return 0
@@ -160,13 +146,12 @@ def upsert_batch(
         )
 
     index = get_index(settings)
-    namespace = paper_id
 
     vectors = [
         {
             "id": node.entity_id,
             "values": emb,
-            "metadata": _build_metadata(node, paper_id),
+            "metadata": _build_metadata(node, doc_id, user_id),
         }
         for node, emb in zip(nodes, embeddings)
     ]
@@ -174,17 +159,16 @@ def upsert_batch(
     total = 0
     for i in range(0, len(vectors), batch_size):
         chunk = vectors[i : i + batch_size]
-        index.upsert(vectors=chunk, namespace=namespace)
+        index.upsert(vectors=chunk, namespace="")
         total += len(chunk)
         logger.debug(
-            "Upserted batch of %d vectors into namespace '%s' (total: %d)",
+            "Upserted batch of %d vectors into default namespace (total: %d)",
             len(chunk),
-            namespace,
             total,
         )
 
     logger.info(
-        "upsert_batch complete: %d vectors upserted for paper %s", total, paper_id
+        "upsert_batch complete: %d vectors upserted for document %s", total, doc_id
     )
     return total
 
@@ -195,29 +179,19 @@ def upsert_batch(
 
 def query_similar(
     embedding: list[float],
-    paper_id: str,
+    doc_id: str,
     top_k: int,
     settings: Settings,
     node_type_filter: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """
-    Query within the namespace of a specific paper.
-
-    Args:
-        embedding: Query vector.
-        paper_id: Restricts results to this paper's namespace and metadata filter.
-        top_k: Number of results; capped at _MAX_TOP_K (20).
-        settings: App settings.
-        node_type_filter: Optional Pinecone metadata filter on the 'type' field.
-
-    Returns:
-        List of {id, score, metadata} dicts ordered by descending score.
+    Query within the default namespace with strict doc_id metadata filter.
     """
     top_k = min(top_k, _MAX_TOP_K)
     index = get_index(settings)
-    namespace = paper_id if paper_id else ""
 
-    filter_dict: dict[str, Any] = {"paper_id": {"$eq": paper_id}}
+    # Every query must include filter {"doc_id": {"$eq": doc_id}}
+    filter_dict: dict[str, Any] = {"doc_id": {"$eq": doc_id}}
     if node_type_filter:
         filter_dict["type"] = {"$eq": node_type_filter}
 
@@ -225,7 +199,7 @@ def query_similar(
         vector=embedding,
         top_k=top_k,
         include_metadata=True,
-        namespace=namespace,
+        namespace="",
         filter=filter_dict,
     )
 
@@ -241,15 +215,7 @@ def query_global(
     settings: Settings,
 ) -> list[dict[str, Any]]:
     """
-    Query across all namespaces (no namespace restriction).
-
-    Args:
-        embedding: Query vector.
-        top_k: Number of results; capped at _MAX_TOP_K (20).
-        settings: App settings.
-
-    Returns:
-        List of {id, score, metadata} dicts ordered by descending score.
+    Query across all documents (no restriction).
     """
     top_k = min(top_k, _MAX_TOP_K)
     index = get_index(settings)
@@ -258,6 +224,7 @@ def query_global(
         vector=embedding,
         top_k=top_k,
         include_metadata=True,
+        namespace="",
     )
 
     return [
@@ -270,14 +237,10 @@ def query_global(
 # Deletion
 # ---------------------------------------------------------------------------
 
-def delete_paper_vectors(paper_id: str, settings: Settings) -> None:
+def delete_paper_vectors(doc_id: str, settings: Settings) -> None:
     """
-    Delete all vectors belonging to a paper by deleting its entire namespace.
-
-    Uses ``delete_all=True`` within the paper's namespace, which is the
-    most efficient way to bulk-remove per-paper data in Pinecone Serverless.
+    Delete all vectors belonging to a document by metadata filter.
     """
     index = get_index(settings)
-    namespace = paper_id
-    index.delete(delete_all=True, namespace=namespace)
-    logger.info("Deleted all vectors for paper %s (namespace '%s')", paper_id, namespace)
+    index.delete(filter={"doc_id": {"$eq": doc_id}}, namespace="")
+    logger.info("Deleted all vectors for doc_id %s using metadata filter", doc_id)
